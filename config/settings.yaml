@@ -1,0 +1,35 @@
+# BOSS直聘求职助手 - 求职标准配置
+# 请根据个人情况修改以下配置项
+
+# 岗位关键词（支持多个，用逗号分隔）
+job_keywords:
+  - Python后端开发
+  - 全栈工程师
+
+# 薪资范围（单位：K/月）
+salary_range:
+  min: 15
+  max: 30
+
+# 工作地点（支持多个城市）
+locations:
+  - 北京
+  - 上海
+  - 杭州
+
+# 工作年限要求（年）
+experience_years:
+  min: 3
+  max: 10
+
+# 学历要求
+education: 本科
+
+# 公司规模偏好（可选）
+company_size_preference: []
+
+# 行业偏好（可选）
+industry_preference: []
+
+# 黑名单公司（排除不投递的公司）
+blacklist_companies: []
