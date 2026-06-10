@@ -1,0 +1,101 @@
+# BOSS直聘求职助手 - API配置文件
+# 
+# 请根据实际情况填写以下配置项
+# 注意：此文件包含敏感信息，请勿提交到版本控制系统
+# 首次使用前请将 'your_api_key_here' 替换为真实的API密钥
+
+# ============================================================
+# 火山引擎 API 配置
+# ============================================================
+volcengine:
+  # API密钥（从火山引擎控制台获取）
+  api_key: ark-3ada555a-4c56-419d-9803-d6151c838791-821ab
+  # API访问地址
+  base_url: https://ark.cn-beijing.volces.com/api/coding/v3
+  # 模型配置
+  models:
+    # 文本模型（用于简历文本解析）
+    text: GLM-5.1
+    # 聊天模型（用于对话、话术生成等）
+    chat: GLM-5.1
+    # 视觉模型（用于简历图片解析）
+    vision: Doubao-Seed3D-2.0
+  # 请求配置
+  timeout: 60
+  max_retries: 3
+
+# ============================================================
+# Browser Use 配置
+# ============================================================
+browser_use:
+  # 浏览器配置
+  browser_config:
+    # 是否启用无头模式（True=无界面，False=有界面）
+    headless: false
+    # 窗口宽度
+    window_width: 1280
+    # 窗口高度
+    window_height: 800
+    # Chromium路径（留空自动使用Playwright默认路径）
+    chromium_path: ""
+  
+  # 反检测配置
+  anti_detection:
+    # 是否启用反检测模式
+    enabled: true
+    # 最小操作延迟（秒）
+    min_delay: 3.0
+    # 最大操作延迟（秒）
+    max_delay: 8.0
+    # 打字速度范围（毫秒/字符）
+    typing_speed_min: 50
+    typing_speed_max: 150
+  
+  # 会话配置
+  session_config:
+    # Cookie存储路径
+    cookie_storage_path: data/browser_cookies.json
+    # 是否自动保存会话
+    auto_save_session: true
+
+# ============================================================
+# 求职自动化配置
+# ============================================================
+automation:
+  # 每日最大沟通数量（防止过度操作触发风控）
+  daily_limit: 50
+  # 匹配度阈值（低于此分数的岗位自动跳过）
+  match_threshold: 60
+  # 操作间隔范围（秒）
+  delay_min: 3
+  delay_max: 8
+  # 是否自动发送打招呼消息
+  auto_send_greeting: true
+  # 是否自动发送简历截图
+  auto_send_resume: true
+  # 回复模式：auto=全自动回复，confirm=人工确认后发送
+  reply_mode: confirm
+
+# ============================================================
+# 日志配置
+# ============================================================
+logging:
+  # 日志级别：DEBUG, INFO, WARNING, ERROR
+  level: INFO
+  # 是否输出到控制台
+  console_output: true
+  # 是否输出到文件
+  file_output: true
+  # 日志文件目录
+  log_dir: data/logs
+  # 日志保留天数
+  backup_days: 30
+
+# ============================================================
+# 数据库配置
+# ============================================================
+database:
+  # SQLite数据库文件路径
+  db_path: data/job_assistant.db
+  # 是否在启动时自动创建表
+  auto_create_tables: true
