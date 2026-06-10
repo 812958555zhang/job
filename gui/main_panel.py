@@ -3,19 +3,18 @@
 
 包含：启动/暂停/停止按钮、状态指示器、今日统计信息
 实现按钮事件绑定与后台任务状态同步
-支持数据统计、去重机制、风控策略优化
+支持真实岗位扫描、匹配评分与自动沟通流程
 """
 
+import asyncio
 import gradio as gr
-import time
-from typing import Optional, Tuple
-from concurrent.futures import ThreadPoolExecutor
 import threading
+from typing import Optional, Tuple
 
-# 导入核心模块
 from browser.agent import BrowserAgent
+from core.automation_engine import run_automation_loop
+from core.profile_manager import get_profile_manager
 from utils.logger import get_logger
-from utils.config_loader import get_config
 from utils.delay_simulator import get_simulator
 from utils.db_helper import get_db
 
@@ -50,7 +49,7 @@ def on_start_click(
     match_threshold: float,
     delay_min: float,
     delay_max: float
-) -> Tuple[str, str, str]:
+) -> Tuple[str, str, str, str]:
     """
     点击"启动自动求职"按钮的回调函数
 
@@ -65,38 +64,38 @@ def on_start_click(
     Returns:
         tuple: (状态文本, 启动按钮状态, 暂停按钮状态, 停止按钮状态)
     """
-    global _browser_agent, _is_running, _is_paused
+    global _browser_agent, _is_running, _is_paused, _task_thread
 
     if _is_running and not _is_paused:
         return "⚠️ 自动化任务已在运行中", "disabled", "enabled", "enabled"
 
+    # 从暂停状态恢复
+    if _is_running and _is_paused:
+        _is_paused = False
+        if _browser_agent:
+            _browser_agent._paused = False
+        _logger.info("▶️ 自动化任务已继续")
+        return "▶️ 自动化任务已继续", "disabled", "enabled", "enabled"
+
+    profile = get_profile_manager().get_active_profile()
+    if profile is None:
+        return (
+            "❌ 请先在「简历管理」页上传并解析简历，生成用户画像",
+            "enabled", "disabled", "disabled",
+        )
+
     try:
-        # 更新状态
         _is_running = True
         _is_paused = False
 
-        # 初始化浏览器Agent
         _logger.info("🚀 正在启动自动化求职任务...")
 
-        # 创建浏览器Agent实例
-        _browser_agent = BrowserAgent()
-
-        # 配置延迟模拟器
         simulator = get_simulator()
         simulator.set_delay_range(delay_min, delay_max)
 
-        # 启动浏览器
-        if _browser_agent.start():
-            _logger.info("✅ BrowserAgent 启动成功")
-
-            # 启动自动化任务线程
-            start_automation_task(daily_limit, match_threshold)
-
-            return "▶️ 自动化任务已启动", "disabled", "enabled", "enabled"
-        else:
-            _is_running = False
-            _logger.error("❌ BrowserAgent 启动失败")
-            return "❌ 浏览器启动失败，请检查日志", "enabled", "disabled", "disabled"
+        _browser_agent = BrowserAgent()
+        start_automation_task(daily_limit, match_threshold, profile)
+        return "▶️ 自动化任务已启动（浏览器初始化中）", "disabled", "enabled", "enabled"
 
     except Exception as e:
         _is_running = False
@@ -166,70 +165,63 @@ def on_stop_click() -> Tuple[str, str, str, str]:
         return f"❌ 停止失败: {str(e)}", "enabled", "disabled", "disabled"
 
 
-def start_automation_task(daily_limit: int, match_threshold: float):
+def start_automation_task(daily_limit: int, match_threshold: float, user_profile):
     """
     启动自动化任务线程
 
     Args:
         daily_limit: 每日最大沟通数量
         match_threshold: 匹配度阈值
+        user_profile: 活跃用户画像
     """
     global _task_thread
 
+    def _on_stats_update(stats: dict):
+        _today_stats.update(stats)
+
     def task_loop():
         """自动化任务主循环"""
-        global _is_running, _is_paused, _today_stats
+        global _is_running, _today_stats
+
+        async def _run_all():
+            if not _browser_agent._running:
+                await _browser_agent.async_start()
+                _logger.info("✅ BrowserAgent 启动成功")
+            return await run_automation_loop(
+                browser_agent=_browser_agent,
+                user_profile=user_profile,
+                daily_limit=daily_limit,
+                match_threshold=match_threshold,
+                should_continue=lambda: _is_running,
+                is_paused=lambda: _is_paused,
+                on_stats_update=_on_stats_update,
+            )
 
         try:
-            _logger.info(f"📋 开始自动化求职任务 | 每日上限: {daily_limit} | 匹配阈值: {match_threshold}")
+            _logger.info(
+                f"📋 自动化任务线程启动 | 每日上限: {daily_limit} | "
+                f"匹配阈值: {match_threshold}"
+            )
 
-            # 模拟扫描流程（实际实现时替换为真实逻辑）
-            processed_count = 0
+            final_stats = asyncio.run(_run_all())
 
-            while _is_running and processed_count < daily_limit:
-                # 等待暂停状态
-                while _is_paused and _is_running:
-                    time.sleep(1)
-                    _logger.debug("⏸️ 任务暂停中...")
-
-                if not _is_running:
-                    break
-
-                # 模拟岗位扫描和匹配
-                _logger.info(f"🔍 正在扫描第 {processed_count + 1}/{daily_limit} 个岗位...")
-
-                # 模拟随机延迟
-                simulator = get_simulator()
-                simulator.random_short_delay()
-
-                # 模拟匹配结果
-                import random
-                match_score = random.uniform(0, 100)
-
-                if match_score >= match_threshold:
-                    # 匹配成功
-                    _today_stats['matched_count'] += 1
-                    _today_stats['total_count'] += 1
-                    _logger.info(f"✅ 找到匹配岗位 | 匹配度: {match_score:.1f}分")
-
-                    # 模拟发送打招呼消息
-                    simulator.random_delay()
-                    _logger.info("💬 已发送打招呼消息")
-
-                else:
-                    # 匹配失败，跳过
-                    _today_stats['skipped_count'] += 1
-                    _logger.info(f"⏭️ 跳过岗位 | 匹配度: {match_score:.1f}分（低于阈值 {match_threshold}）")
-
-                processed_count += 1
-
-            _logger.info(f"📊 任务完成 | 总计处理: {processed_count} | 匹配: {_today_stats['matched_count']} | 跳过: {_today_stats['skipped_count']}")
+            _today_stats.update(final_stats)
+            _logger.info(
+                f"📊 任务完成 | 沟通: {final_stats['matched_count']} | "
+                f"跳过: {final_stats['skipped_count']}"
+            )
 
         except Exception as e:
             _logger.error(f"💥 自动化任务异常: {e}", exc_info=True)
+        finally:
             _is_running = False
+            if _browser_agent and _browser_agent._running:
+                try:
+                    _browser_agent.stop()
+                    _logger.info("🛑 BrowserAgent 已停止")
+                except Exception as stop_err:
+                    _logger.warning(f"停止 BrowserAgent 时出错: {stop_err}")
 
-    # 启动任务线程
     _task_thread = threading.Thread(target=task_loop, daemon=True)
     _task_thread.start()
 
@@ -353,10 +345,10 @@ def create_main_panel():
 
     with gr.Accordion("高级选项", open=False):
         daily_limit = gr.Slider(
-            minimum=10,
+            minimum=1,
             maximum=100,
-            value=50,
-            step=5,
+            value=2,
+            step=1,
             label="每日最大沟通数量"
         )
         match_threshold = gr.Slider(

@@ -14,6 +14,7 @@ import random
 import time
 from typing import Optional
 
+from browser.agent_helpers import run_browser_use_task, navigate_page, go_back_page, scroll_page
 from utils.logger import get_logger
 
 
@@ -45,6 +46,12 @@ class BrowserOperator:
         self._typing_speed_min = browser_agent._config.get("anti_detection", {}).get("typing_speed_min", 50)
         self._typing_speed_max = browser_agent._config.get("anti_detection", {}).get("typing_speed_max", 150)
 
+    async def _get_browser_use_agent(self):
+        """获取 browser-use Agent（懒加载）"""
+        if hasattr(self._browser_agent, "ensure_browser_use_agent"):
+            return await self._browser_agent.ensure_browser_use_agent()
+        return self._browser_agent._agent
+
     async def click_element(self, description: str) -> bool:
         """
         点击页面元素（AI驱动）
@@ -60,7 +67,7 @@ class BrowserOperator:
         self._logger.info(f"执行点击操作: {description}")
 
         try:
-            agent = self._browser_agent._agent
+            agent = await self._get_browser_use_agent()
             if not agent:
                 self._logger.error("Browser Use Agent 未初始化")
                 return False
@@ -69,8 +76,9 @@ class BrowserOperator:
             await self._random_delay()
 
             # 使用Browser Use执行点击操作
-            result = await agent.run(
-                task=f"点击页面上的'{description}'",
+            result = await run_browser_use_task(
+                agent,
+                f"点击页面上的'{description}'",
             )
 
             if result and hasattr(result, 'content'):
@@ -98,7 +106,7 @@ class BrowserOperator:
         self._logger.info(f"执行输入操作，文本长度: {len(text)}字符")
 
         try:
-            agent = self._browser_agent._agent
+            agent = await self._get_browser_use_agent()
             if not agent:
                 self._logger.error("Browser Use Agent 未初始化")
                 return False
@@ -107,14 +115,14 @@ class BrowserOperator:
             await self._random_delay()
 
             if simulate_typing:
-                # 使用Browser Use的细粒度操作来模拟打字
-                result = await agent.run(
-                    task=f"在聊天输入框中输入以下文本，模拟人类打字速度：{text}",
+                result = await run_browser_use_task(
+                    agent,
+                    f"在聊天输入框中输入以下文本，模拟人类打字速度：{text}",
                 )
             else:
-                # 直接输入（不模拟打字）
-                result = await agent.run(
-                    task=f"在聊天输入框中输入文本：{text}",
+                result = await run_browser_use_task(
+                    agent,
+                    f"在聊天输入框中输入文本：{text}",
                 )
 
             if result and hasattr(result, 'content'):
@@ -138,7 +146,7 @@ class BrowserOperator:
         self._logger.info("执行发送消息操作")
 
         try:
-            agent = self._browser_agent._agent
+            agent = await self._get_browser_use_agent()
             if not agent:
                 self._logger.error("Browser Use Agent 未初始化")
                 return False
@@ -147,8 +155,9 @@ class BrowserOperator:
             await self._random_delay()
 
             # 使用Browser Use执行发送操作
-            result = await agent.run(
-                task="点击发送按钮发送消息，或者按回车键发送",
+            result = await run_browser_use_task(
+                agent,
+                "点击发送按钮发送消息，或者按回车键发送",
             )
 
             if result and hasattr(result, 'content'):
@@ -180,7 +189,7 @@ class BrowserOperator:
                 self._logger.error("页面不可用")
                 return False
 
-            await page.goto(url, wait_until="domcontentloaded")
+            await navigate_page(page, url, wait_seconds=2.0)
             self._logger.info(f"成功导航到: {url}")
             return True
 
@@ -203,7 +212,7 @@ class BrowserOperator:
                 self._logger.error("页面不可用")
                 return False
 
-            await page.go_back()
+            await go_back_page(page)
             self._logger.info("成功返回上一页")
             return True
 
@@ -230,12 +239,9 @@ class BrowserOperator:
                 return False
 
             if pixels:
-                await page.evaluate(f"window.scrollBy(0, {pixels})")
+                await scroll_page(page, pixels)
             else:
-                await page.evaluate("window.scrollBy(0, window.innerHeight)")
-
-            # 等待滚动动画完成
-            await asyncio.sleep(0.5)
+                await scroll_page(page)
 
             self._logger.info("页面滚动成功")
             return True
@@ -279,7 +285,7 @@ class BrowserOperator:
         self._logger.info("点击下一页")
 
         try:
-            agent = self._browser_agent._agent
+            agent = await self._get_browser_use_agent()
             if not agent:
                 self._logger.error("Browser Use Agent 未初始化")
                 return False
@@ -288,8 +294,9 @@ class BrowserOperator:
             await self._random_delay()
 
             # 使用Browser Use执行翻页操作
-            result = await agent.run(
-                task="点击页面底部的'下一页'按钮或翻页按钮",
+            result = await run_browser_use_task(
+                agent,
+                "点击页面底部的'下一页'按钮或翻页按钮",
             )
 
             if result and hasattr(result, 'content'):
@@ -317,14 +324,15 @@ class BrowserOperator:
         self._logger.info(f"等待元素出现: {description}")
 
         try:
-            agent = self._browser_agent._agent
+            agent = await self._get_browser_use_agent()
             if not agent:
                 self._logger.error("Browser Use Agent 未初始化")
                 return False
 
             # 使用Browser Use等待元素
-            result = await agent.run(
-                task=f"等待页面上的'{description}'元素出现",
+            result = await run_browser_use_task(
+                agent,
+                f"等待页面上的'{description}'元素出现",
             )
 
             if result and hasattr(result, 'content'):
@@ -351,7 +359,7 @@ class BrowserOperator:
         self._logger.info(f"切换标签页: {index_or_description}")
 
         try:
-            agent = self._browser_agent._agent
+            agent = await self._get_browser_use_agent()
             if not agent:
                 self._logger.error("Browser Use Agent 未初始化")
                 return False
@@ -361,7 +369,7 @@ class BrowserOperator:
             else:
                 task = f"切换到包含'{index_or_description}'的标签页"
 
-            result = await agent.run(task=task)
+            result = await run_browser_use_task(agent, task)
 
             if result and hasattr(result, 'content'):
                 self._logger.info("标签页切换成功")
@@ -389,7 +397,11 @@ class BrowserOperator:
                 self._logger.error("页面不可用")
                 return False
 
-            await page.close()
+            session = getattr(self._browser_agent, "_browser_session", None)
+            if session and hasattr(session, "close_page"):
+                await session.close_page(page)
+            elif hasattr(page, "close"):
+                await page.close()
             self._logger.info("成功关闭当前标签页")
             return True
 

@@ -109,10 +109,10 @@ def create_config_page():
                 info="降低被平台识别为机器人的风险"
             )
             daily_limit = gr.Slider(
-                minimum=20,
+                minimum=1,
                 maximum=100,
-                value=50,
-                step=5,
+                value=2,
+                step=1,
                 label="每日最大沟通数量"
             )
 

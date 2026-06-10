@@ -1,0 +1,52 @@
+[
+  {
+    "name": "ab_guid",
+    "value": "0308ef20-95ae-4098-bbe4-1777ab6c13d6",
+    "domain": "www.zhipin.com",
+    "path": "/",
+    "expires": 1815621633.711796,
+    "httpOnly": false,
+    "secure": false,
+    "sameSite": "Lax"
+  },
+  {
+    "name": "__g",
+    "value": "-",
+    "domain": ".zhipin.com",
+    "path": "/",
+    "expires": -1,
+    "httpOnly": false,
+    "secure": false,
+    "sameSite": "Lax"
+  },
+  {
+    "name": "__c",
+    "value": "1781061634",
+    "domain": ".zhipin.com",
+    "path": "/",
+    "expires": -1,
+    "httpOnly": false,
+    "secure": false,
+    "sameSite": "Lax"
+  },
+  {
+    "name": "__l",
+    "value": "l=%2Fwww.zhipin.com%2Fweb%2Fuser%2F%3Fka%3Dheader-login&r=&g=&s=3&friend_source=0&s=3&friend_source=0",
+    "domain": ".zhipin.com",
+    "path": "/",
+    "expires": -1,
+    "httpOnly": false,
+    "secure": false,
+    "sameSite": "Lax"
+  },
+  {
+    "name": "__a",
+    "value": "80292208.1781061634..1781061634.7.1.7.7",
+    "domain": ".zhipin.com",
+    "path": "/",
+    "expires": 1815622269.806954,
+    "httpOnly": false,
+    "secure": false,
+    "sameSite": "Lax"
+  }
+]

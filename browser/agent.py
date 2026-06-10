@@ -16,14 +16,26 @@ import asyncio
 import json
 import os
 import random
+import socket
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Union
 
 from browser_use import Agent
+from browser_use.browser.profile import BrowserProfile
 from browser_use.llm import ChatOpenAI
+
+from browser.agent_helpers import (
+    run_async,
+    navigate_page,
+    get_page_url,
+    get_page_title,
+    check_login_by_cookies,
+)
 from playwright.async_api import Browser as AsyncBrowser
+from playwright.async_api import BrowserContext as AsyncBrowserContext
 from playwright.async_api import Page as AsyncPage
+from playwright.async_api import Playwright as AsyncPlaywright
 
 from utils.config_loader import get_config
 from utils.logger import get_logger
@@ -137,6 +149,10 @@ class SessionManager:
                 self._logger.debug("Cookie 文件不存在，跳过加载")
                 return []
 
+            if self._cookie_path.stat().st_size == 0:
+                self._logger.debug("Cookie 文件为空，跳过加载")
+                return []
+
             import json
 
             with open(self._cookie_path, 'r', encoding='utf-8') as f:
@@ -157,6 +173,36 @@ class SessionManager:
                 self._logger.info("✓ 本地 Cookie 文件已清除")
         except Exception as e:
             self._logger.warning(f"清除 Cookie 文件失败: {e}")
+
+
+# ============================================================
+# 辅助函数
+# ============================================================
+
+
+def _allocate_free_port() -> int:
+    """分配本地可用 TCP 端口（用于 Chromium remote-debugging-port）"""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+async def _wait_for_cdp_http_ready(cdp_url: str, timeout: float = 20.0) -> None:
+    """等待 Chromium CDP HTTP 端点可访问"""
+    import urllib.error
+    import urllib.request
+
+    version_url = cdp_url.rstrip("/") + "/json/version"
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(version_url, timeout=2) as resp:
+                if resp.status == 200:
+                    return
+        except (urllib.error.URLError, TimeoutError, OSError):
+            pass
+        await asyncio.sleep(0.3)
+    raise BrowserCrashError(f"CDP 端口未就绪: {cdp_url}")
 
 
 # ============================================================
@@ -187,8 +233,9 @@ class BrowserAgent:
         _config: 合并后的配置字典
     """
 
-    # BOSS 直聘首页地址
+    # BOSS 直聘地址（登录页使用 www 同域，避免 login 子域触发 browser-use 标签恢复跳转到 about:blank）
     BOSS_ZHIPIN_URL: str = "https://www.zhipin.com/"
+    BOSS_LOGIN_URL: str = "https://www.zhipin.com/web/user/?ka=header-login"
 
     # 默认配置常量
     DEFAULT_WINDOW_WIDTH: int = 1280
@@ -222,8 +269,13 @@ class BrowserAgent:
         self._running: bool = False
         self._agent: Optional[Agent] = None
         self._browser: Optional[AsyncBrowser] = None
-        self._context = None  # Playwright 浏览器上下文
-        self._page: Optional[AsyncPage] = None
+        self._playwright: Optional[AsyncPlaywright] = None
+        self._playwright_context: Optional[AsyncBrowserContext] = None
+        self._cdp_port: Optional[int] = None
+        self._context = None  # Playwright BrowserContext（兼容旧会话管理接口）
+        self._browser_session = None
+        self._page: Optional[Any] = None  # browser-use Page 或 Playwright Page
+        self._browser_loop: Optional[asyncio.AbstractEventLoop] = None
 
         # 新增：异常处理和状态监控相关属性
         self._retry_count: int = 0  # 当前已重试次数
@@ -361,11 +413,14 @@ class BrowserAgent:
                 "⚠️ LLM API Key 未配置！Browser Use Agent 将无法正常工作"
             )
 
-        # 使用 browser-use 的 ChatOpenAI（继承 BaseChatModel，带 provider 属性）
+        # GLM 等火山引擎模型不支持 response_format=json_schema，
+        # 需将 schema 写入 system prompt 并关闭强制结构化输出
         client = ChatOpenAI(
             model=llm_cfg.get("model_name", "GLM-5.1"),
             api_key=api_key,
             base_url=llm_cfg.get("api_base_url", ""),
+            add_schema_to_system_prompt=True,
+            dont_force_structured_output=True,
         )
 
         self._logger.info(
@@ -375,120 +430,269 @@ class BrowserAgent:
 
         return client
 
-    def start(self) -> bool:
+    async def async_start(self) -> bool:
         """
-        启动 Browser Use Agent
+        启动 Browser Use Agent（async）
 
-        创建 Agent 实例、启动 Chromium 浏览器，
-        并导航至 BOSS 直聘首页。
-
-        Returns:
-            bool: 启动成功返回 True，失败返回 False
-
-        Raises:
-            BrowserCrashError: 浏览器启动失败或崩溃
-            NetworkTimeoutError: 页面导航超时
+        须在已运行的事件循环中调用（如自动化任务线程）。
         """
         if self._running:
             self._logger.warning("BrowserAgent 已在运行中，无需重复启动")
             return True
 
         try:
-            self._logger.info("🚀 正在启动 Browser Use Agent...")
+            self._logger.info("🚀 正在启动浏览器...")
 
-            # 重置状态监控属性
             self._retry_count = 0
             self._last_error = None
             self._paused = False
+            self._agent = None
 
-            # 构建浏览器配置
-            browser_cfg = self._config.get("browser_config", {})
-            anti_cfg = self._config.get("anti_detection", {})
-            llm_cfg = self._config.get("llm_config", {})
-
-            # 创建 Browser Use Agent 实例
-            self._agent = Agent(
-                task="打开BOSS直聘网站并保持在线",
-                llm=self._llm_client,
-                browser_config={
-                    "browser_type": "chromium",
-                    "headless": browser_cfg.get("headless", self.DEFAULT_HEADLESS),
-                    "viewport_width": browser_cfg.get("window_width", self.DEFAULT_WINDOW_WIDTH),
-                    "viewport_height": browser_cfg.get("window_height", self.DEFAULT_WINDOW_HEIGHT),
-                },
-            )
-
-            # 启动浏览器并获取底层 Playwright 实例
-            # Browser Use Agent 内部管理浏览器生命周期
             self._running = True
-            self._start_time = time.time()  # 记录启动时间
-            self._logger.info("✓ Browser Use Agent 已创建")
+            self._start_time = time.time()
 
-            # 获取底层浏览器和页面对象
-            self._browser, self._context = self._get_browser_instances()
-
-            # 导航至 BOSS 直聘首页
-            if self._page:
-                self._navigate_to_home()
+            await self._async_start_browser()
 
             self._logger.info("✅ BrowserAgent 启动成功")
             return True
 
         except Exception as e:
             self._running = False
+            await self._cleanup_failed_start()
             error_msg = f"启动 BrowserAgent 失败: {e}"
             self._logger.error(error_msg, exc_info=True)
-            self._last_error = e  # 记录最后错误
+            self._last_error = e
 
-            # 根据错误类型抛出对应自定义异常
             err_str = str(e).lower()
             if "timeout" in err_str or "timed out" in err_str:
                 raise NetworkTimeoutError(
                     message="浏览器启动超时",
                     timeout=30.0,
                 ) from e
-            else:
-                raise BrowserCrashError(
-                    message=error_msg,
-                    original_error=e,
-                ) from e
+            raise BrowserCrashError(
+                message=error_msg,
+                original_error=e,
+            ) from e
 
-    async def _get_browser_instances(self):
+    def start(self) -> bool:
         """
-        获取底层 Playwright 浏览器和上下文实例
+        启动 Browser Use Agent（同步包装）
 
-        从 Browser Use Agent 内部提取 Playwright 的 Browser 和 Context 对象，
-        供需要直接操作浏览器的场景使用。
-
-        Returns:
-            tuple: (Browser 实例, BrowserContext 实例)
+        推荐在自动化任务线程中通过 async_start() 启动。
         """
+        if self._running:
+            return True
+
+        if self._browser_loop and self._browser_loop.is_running():
+            future = asyncio.run_coroutine_threadsafe(self.async_start(), self._browser_loop)
+            return future.result(timeout=180)
+
+        return asyncio.run(self.async_start())
+
+    async def _cleanup_failed_start(self) -> None:
+        """启动失败时释放半初始化的浏览器资源"""
+        if self._agent:
+            try:
+                await self._agent.close()
+            except Exception:
+                pass
+            self._agent = None
+        if self._playwright_context:
+            try:
+                await self._playwright_context.close()
+            except Exception:
+                pass
+            self._playwright_context = None
+        if self._browser:
+            try:
+                await self._browser.close()
+            except Exception:
+                pass
+            self._browser = None
+        if self._playwright:
+            try:
+                await self._playwright.stop()
+            except Exception:
+                pass
+            self._playwright = None
+        self._browser_session = None
+        self._context = None
+        self._page = None
+        self._cdp_port = None
+
+    async def _async_start_browser(self) -> None:
+        """
+        使用 Playwright 普通模式启动浏览器（无持久化 profile 目录）
+
+        登录态通过 data/browser_cookies.json 恢复，避免 browser_profile 膨胀
+        及 Chromium 会话恢复导致的多标签 / 页面被切走。
+        """
+        from playwright.async_api import async_playwright
+
+        self._browser_loop = asyncio.get_running_loop()
+        browser_cfg = self._config.get("browser_config", {})
+        headless = browser_cfg.get("headless", self.DEFAULT_HEADLESS)
+        width = browser_cfg.get("window_width", self.DEFAULT_WINDOW_WIDTH)
+        height = browser_cfg.get("window_height", self.DEFAULT_WINDOW_HEIGHT)
+
+        self._cdp_port = _allocate_free_port()
+        cdp_url = f"http://127.0.0.1:{self._cdp_port}"
+
+        self._playwright = await async_playwright().start()
+
+        # 增强反检测启动参数
+        launch_args = [
+            f"--remote-debugging-port={self._cdp_port}",
+            "--disable-blink-features=AutomationControlled",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-web-security",
+            "--disable-features=IsolateOrigins,site-per-process",
+            "--disable-site-isolation-trials",
+            "--disable-bundled-ppapi-flash",
+            "--disable-plugins-discovery",
+            "--disable-background-networking",
+            "--disable-background-timer-throttling",
+            "--disable-backgrounding-occluded-windows",
+            "--disable-breakpad",
+            "--disable-component-extensions-with-background-pages",
+            "--disable-default-apps",
+            "--disable-dev-shm-usage",
+            "--disable-extensions",
+            "--disable-features=TranslateUI",
+            "--disable-hang-monitor",
+            "--disable-ipc-flooding-protection",
+            "--disable-popup-blocking",
+            "--disable-prompt-on-repost",
+            "--disable-renderer-backgrounding",
+            "--disable-sync",
+            "--force-color-profile=srgb",
+            "--metrics-recording-only",
+            "--safebrowsing-disable-auto-update",
+            "--enable-automation",
+            "--password-store=basic",
+            "--use-mock-keychain",
+            "--lang=zh-CN",
+            "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+        ]
+
+        if not headless:
+            launch_args.extend([
+                "--start-maximized",
+                "--window-position=0,0",
+            ])
+
+        self._browser = await self._playwright.chromium.launch(
+            headless=headless,
+            args=launch_args,
+        )
+
+        # 创建带有反检测特征的上下文
+        self._playwright_context = await self._browser.new_context(
+            viewport={"width": width, "height": height},
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+            locale="zh-CN",
+            timezone_id="Asia/Shanghai",
+            permissions=["geolocation"],
+            java_script_enabled=True,
+            bypass_csp=True,
+        )
+
+        # 注入反检测脚本，隐藏 webdriver 标志
+        await self._playwright_context.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {
+                get: () => undefined
+            });
+            Object.defineProperty(navigator, 'plugins', {
+                get: () => [1, 2, 3, 4, 5]
+            });
+            Object.defineProperty(navigator, 'languages', {
+                get: () => ['zh-CN', 'zh', 'en']
+            });
+            window.chrome = { runtime: {} };
+        """)
+        self._context = self._playwright_context
+
+        # 暂时不加载旧 Cookie，避免 BOSS 直聘检测到异常会话
+        # 用户需要重新手动登录，这样更稳定
+        saved_cookies = self._session_manager.load_cookies()
+        if saved_cookies:
+            self._logger.info(f"已保存的 Cookie 暂不加载（共 {len(saved_cookies)} 条），建议重新登录以确保会话干净")
+
+        await _wait_for_cdp_http_ready(cdp_url)
+        self._logger.info(f"Playwright 浏览器已启动 | CDP: {cdp_url}")
+
+        # 创建新页面并导航到登录页
+        self._page = await self._playwright_context.new_page()
+
+        # 导航到登录页 - 使用 Playwright 原生方法确保可靠
         try:
-            # Browser Use Agent 通过 agent.browser_manager 访问底层浏览器
-            if hasattr(self._agent, '_browser_context'):
-                context = self._agent._browser_context
-                browser = await context.browser
-                page = await context.new_page() if not self._page else self._page
-                self._page = page
-                return browser, context
-            return None, None
+            await self._page.goto(
+                self.BOSS_LOGIN_URL,
+                wait_until="domcontentloaded",
+                timeout=30000
+            )
+            await asyncio.sleep(2.0)
+            final_url = self._page.url
+
+            # 如果仍然是 about:blank，尝试再次导航
+            if "about:blank" in final_url:
+                await self._page.goto(self.BOSS_LOGIN_URL, timeout=30000)
+                await asyncio.sleep(2.0)
+                final_url = self._page.url
+
+            if "zhipin.com" in final_url:
+                self._logger.info(f"已打开 BOSS 直聘登录页 | URL: {final_url}")
+            else:
+                self._logger.warning(
+                    f"登录页导航异常 | 当前 URL: {final_url}"
+                )
         except Exception as e:
-            self._logger.warning(f"获取浏览器实例时发生异常（非致命）: {e}")
-            return None, None
+            self._logger.error(f"导航到登录页失败: {e}")
+            final_url = await get_page_url(self._page) if self._page else ""
 
-    def _navigate_to_home(self) -> None:
+    async def ensure_browser_use_agent(self) -> Agent:
         """
-        导航至 BOSS 直聘首页
+        懒加载 browser-use Agent 并连接到 Playwright 已启动的浏览器
 
-        在当前活跃的 Page 上打开 BOSS 直聘网站，
-        并等待页面基本元素加载完成。
-        使用配置中的超时时间，支持自动重试机制。
+        仅在需要 AI 驱动点击等操作时调用，避免登录等待期间 SessionManager 干扰页面。
         """
+        if self._agent is not None:
+            return self._agent
+
+        if not self._cdp_port:
+            raise BrowserCrashError("浏览器未启动，无法初始化 Browser Use Agent")
+
+        cdp_url = f"http://127.0.0.1:{self._cdp_port}"
+        browser_profile = BrowserProfile(
+            cdp_url=cdp_url,
+            is_local=False,
+            enable_default_extensions=False,
+            keep_alive=True,
+            allowed_domains=["*.zhipin.com"],
+            headless=self._config.get("browser_config", {}).get(
+                "headless", self.DEFAULT_HEADLESS
+            ),
+        )
+
+        self._agent = Agent(
+            task="在 BOSS 直聘页面上执行用户指定的浏览器操作",
+            llm=self._llm_client,
+            browser_profile=browser_profile,
+            directly_open_url=False,
+        )
+
+        await self._agent.browser_session.start()
+        self._browser_session = self._agent.browser_session
+        self._logger.info("Browser Use Agent 已懒加载并连接到现有浏览器")
+        return self._agent
+
+    async def _async_navigate_to_home(self) -> None:
+        """导航至 BOSS 直聘首页（async）"""
         if not self._page:
             self._logger.warning("当前没有可用的页面对象，跳过导航")
             return
 
-        # 获取配置的超时时间
         error_cfg = self._config.get("error_handling", {})
         timeout = error_cfg.get(
             "page_load_timeout",
@@ -500,27 +704,19 @@ class BrowserAgent:
             min_delay = anti_cfg.get("min_delay", self.DEFAULT_MIN_DELAY)
             max_delay = anti_cfg.get("max_delay", self.DEFAULT_MAX_DELAY)
 
-            # 随机延迟，模拟人类行为
             delay = random.uniform(min_delay, max_delay)
             self._logger.info(f"⏳ 等待 {delay:.1f}s 后导航至 BOSS 直聘...")
-            time.sleep(delay)
+            await asyncio.sleep(delay)
 
-            # 导航至首页（使用可配置的超时时间）
-            loop = asyncio.get_event_loop()
-            loop.run_until_complete(
-                self._page.goto(self.BOSS_ZHIPIN_URL, wait_until="domcontentloaded", timeout=timeout * 1000)
-            )
-
-            current_url = loop.run_until_complete(self._page.url)
-            self._logger.info(f"✓ 已导航至 {current_url}")
+            await navigate_page(self._page, self.BOSS_ZHIPIN_URL, wait_seconds=2.0)
+            self._logger.info(f"✓ 已导航至 BOSS 直聘首页: {self.BOSS_ZHIPIN_URL}")
 
         except Exception as e:
             self._logger.error(f"导航至 BOSS 直聘首页失败: {e}", exc_info=True)
-            self._last_error = e  # 记录最后错误
+            self._last_error = e
 
             err_str = str(e).lower()
             if "timeout" in err_str:
-                # 超时时设置暂停状态并记录日志
                 self._paused = True
                 self._logger.warning(
                     f"⚠️ 页面加载超时（{timeout}s），已暂停当前操作。"
@@ -531,6 +727,73 @@ class BrowserAgent:
                     timeout=timeout,
                 ) from e
             raise
+
+    def _navigate_to_home(self) -> None:
+        """同步包装：导航至 BOSS 直聘首页"""
+        if self._browser_loop and self._browser_loop.is_running():
+            future = asyncio.run_coroutine_threadsafe(
+                self._async_navigate_to_home(), self._browser_loop
+            )
+            future.result(timeout=120)
+        else:
+            run_async(self._async_navigate_to_home())
+
+    async def async_stop(self) -> None:
+        """停止 Browser Use Agent 并释放所有资源（async）"""
+        if not self._running:
+            self._logger.debug("BrowserAgent 未在运行，无需停止")
+            return
+
+        try:
+            self._logger.info("🛑 正在停止 Browser Use Agent...")
+
+            session_cfg = self._config.get("session_config", {})
+            if session_cfg.get("auto_save_session", True):
+                await self._async_save_session()
+
+            if self._agent:
+                try:
+                    await self._agent.close()
+                except Exception:
+                    pass
+                self._agent = None
+
+            if self._playwright_context:
+                try:
+                    await self._playwright_context.close()
+                except Exception:
+                    pass
+                self._playwright_context = None
+
+            if self._browser:
+                try:
+                    await self._browser.close()
+                except Exception:
+                    pass
+                self._browser = None
+
+            if self._playwright:
+                try:
+                    await self._playwright.stop()
+                except Exception:
+                    pass
+                self._playwright = None
+
+            self._browser = None
+            self._context = None
+            self._browser_session = None
+            self._page = None
+            self._cdp_port = None
+            self._running = False
+            self._start_time = None
+            self._paused = False
+
+            self._logger.info("✓ BrowserAgent 已安全停止，所有资源已释放")
+
+        except Exception as e:
+            self._running = False
+            self._last_error = e
+            self._logger.error(f"停止 BrowserAgent 时发生异常: {e}", exc_info=True)
 
     def stop(self) -> None:
         """
@@ -546,43 +809,31 @@ class BrowserAgent:
             self._logger.debug("BrowserAgent 未在运行，无需停止")
             return
 
-        try:
-            self._logger.info("🛑 正在停止 Browser Use Agent...")
+        if self._browser_loop and self._browser_loop.is_running():
+            future = asyncio.run_coroutine_threadsafe(self.async_stop(), self._browser_loop)
+            future.result(timeout=120)
+        else:
+            run_async(self.async_stop())
 
-            # 保存会话状态（如果启用）
-            session_cfg = self._config.get("session_config", {})
-            if session_cfg.get("auto_save_session", True):
-                self._save_session()
-
-            # 关闭 Agent
-            if self._agent:
-                # Browser Use Agent 的关闭逻辑
-                if hasattr(self._agent, 'stop'):
-                    try:
-                        loop = asyncio.get_event_loop()
-                        if loop.is_running():
-                            # 如果事件循环已在运行，创建任务来关闭
-                            loop.create_task(self._agent.stop())
-                        else:
-                            loop.run_until_complete(self._agent.stop())
-                    except RuntimeError:
-                        pass  # 无可用事件循环时忽略
-                self._agent = None
-
-            # 清空引用和重置状态
-            self._browser = None
-            self._context = None
-            self._page = None
-            self._running = False
-            self._start_time = None
-            self._paused = False
-
-            self._logger.info("✓ BrowserAgent 已安全停止，所有资源已释放")
-
-        except Exception as e:
-            self._running = False
-            self._last_error = e
-            self._logger.error(f"停止 BrowserAgent 时发生异常: {e}", exc_info=True)
+    async def _async_save_session(self) -> None:
+        """保存 Playwright 浏览器 Cookie 到本地"""
+        if self._playwright_context:
+            try:
+                cookies = await self._playwright_context.cookies()
+                with open(
+                    self._session_manager._cookie_path, "w", encoding="utf-8"
+                ) as f:
+                    json.dump(cookies, f, ensure_ascii=False, indent=2)
+                self._logger.info(
+                    f"Cookie 已保存至 {self._session_manager._cookie_path}"
+                    f"（共 {len(cookies)} 条）"
+                )
+            except Exception as exc:
+                self._logger.warning(f"保存 Cookie 失败: {exc}")
+        elif self._context:
+            self._session_manager.save_cookies(self._context)
+        else:
+            self._logger.debug("无可用的浏览器上下文，跳过会话保存")
 
     def _save_session(self) -> None:
         """
@@ -591,10 +842,13 @@ class BrowserAgent:
         通过 SessionManager 将浏览器 Cookie 持久化到本地文件，
         以便下次启动时恢复登录状态。
         """
-        if self._context:
-            self._session_manager.save_cookies(self._context)
+        if self._browser_loop and self._browser_loop.is_running():
+            future = asyncio.run_coroutine_threadsafe(
+                self._async_save_session(), self._browser_loop
+            )
+            future.result(timeout=30)
         else:
-            self._logger.debug("无可用的浏览器上下文，跳过会话保存")
+            run_async(self._async_save_session())
 
     def restart(self) -> bool:
         """
@@ -655,15 +909,14 @@ class BrowserAgent:
             return None
         return self._browser
 
-    def get_page(self) -> Optional[AsyncPage]:
+    def get_page(self) -> Optional[Any]:
         """
         获取当前活跃的 Page 对象
 
-        返回当前浏览器中活跃的页面标签页实例，
-        用于执行页面级别的操作（点击、输入、截图等）。
+        返回 browser-use Page（CDP）或 Playwright Page，取决于底层实现。
 
         Returns:
-            AsyncPage: Playwright 异步页面对象，未启动时返回 None
+            页面对象，未启动时返回 None
         """
         if not self._running or not self._page:
             self._logger.warning("浏览器页面不可用，请先调用 start()")
@@ -705,14 +958,22 @@ class BrowserAgent:
             return False
 
         try:
-            import asyncio
+            async def _check_login():
+                if hasattr(self._page, "get_elements_by_css_selector"):
+                    elements = await self._page.get_elements_by_css_selector(
+                        '[class*="user"], [class*="avatar"], [class*="login"]'
+                    )
+                    return bool(elements)
+                if hasattr(self._page, "query_selector"):
+                    login_indicator = await self._page.query_selector(
+                        '[class*="user"], [class*="avatar"], [class*="login"]'
+                    )
+                    return bool(login_indicator)
+                return False
 
-            # 检查是否存在登录后才会显示的用户相关元素
-            login_indicator = asyncio.get_event_loop().run_until_complete(
-                self._page.query_selector('[class*="user"], [class*="avatar"], [class*="login"]')
-            )
+            has_login = run_async(_check_login())
 
-            if login_indicator:
+            if has_login:
                 self._logger.info("✓ 当前登录状态正常")
                 return True
             else:
@@ -900,7 +1161,14 @@ class BrowserAgent:
         Returns:
             bool: 进程存活返回 True，否则返回 False
         """
-        if not self._running or not self._browser:
+        if not self._running:
+            return False
+
+        # Playwright 主控或 browser-use 会话存在时，通过页面响应判断存活
+        if self._playwright_context or self._browser_session or self._page:
+            return self._check_page_responsive()
+
+        if not self._browser:
             return False
 
         try:
@@ -960,17 +1228,15 @@ class BrowserAgent:
             return False
 
         try:
-            loop = asyncio.new_event_loop()
-            try:
-                # 执行简单的 JavaScript 检测页面响应
-                result = loop.run_until_complete(
-                    self._page.evaluate("() => { return { ready: document.readyState, url: location.href }; }")
+            async def _evaluate():
+                return await self._page.evaluate(
+                    "() => ({ ready: document.readyState, url: location.href })"
                 )
-                if result and result.get('ready') in ['interactive', 'complete']:
-                    return True
-                return False
-            finally:
-                loop.close()
+
+            result = run_async(_evaluate())
+            if result and result.get('ready') in ['interactive', 'complete']:
+                return True
+            return False
 
         except Exception as e:
             self._logger.debug(f"页面响应检测异常: {e}")
@@ -1140,12 +1406,8 @@ class BrowserAgent:
         # 安全获取页面信息
         if self._page:
             try:
-                loop = asyncio.new_event_loop()
-                try:
-                    diagnosis_info["url"] = loop.run_until_complete(self._page.url)
-                    diagnosis_info["title"] = loop.run_until_complete(self._page.title())
-                finally:
-                    loop.close()
+                diagnosis_info["url"] = run_async(get_page_url(self._page))
+                diagnosis_info["title"] = run_async(get_page_title(self._page))
             except Exception as page_e:
                 self._logger.warning(f"获取页面信息失败: {page_e}")
 

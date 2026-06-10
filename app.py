@@ -6,6 +6,16 @@ BOSS直聘求职助手 - 主程序入口
 
 import gradio as gr
 import logging
+import sys
+
+# Windows 控制台默认 GBK，含 emoji 的日志会触发 UnicodeEncodeError
+if sys.platform == "win32":
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
 
 # 初始化日志系统（必须在导入其他模块之前）
 from utils.logger import setup_logger, get_logger

@@ -12,6 +12,7 @@ import asyncio
 import time
 from typing import Callable, Dict, Optional
 
+from browser.agent_helpers import run_browser_use_task
 from utils.logger import get_logger
 
 
@@ -222,14 +223,18 @@ class ReplyWatcher:
             Dict: 包含 unread_count 和 message_count 的字典，失败返回 None
         """
         try:
-            agent = self._browser_agent._agent
+            if hasattr(self._browser_agent, "ensure_browser_use_agent"):
+                agent = await self._browser_agent.ensure_browser_use_agent()
+            else:
+                agent = self._browser_agent._agent
             if not agent:
                 self._logger.error("Browser Use Agent 未初始化")
                 return None
 
             # 使用Browser Use获取消息列表状态
-            result = await agent.run(
-                task="获取当前消息列表的状态，包括：1)未读消息数量；2)消息会话总数",
+            result = await run_browser_use_task(
+                agent,
+                "获取当前消息列表的状态，包括：1)未读消息数量；2)消息会话总数",
             )
 
             if result and hasattr(result, 'content'):

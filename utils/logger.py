@@ -17,6 +17,29 @@ from typing import Optional
 # 模块级变量：记录是否已完成自动初始化
 _AUTO_INITIALIZED: bool = False
 
+# 项目根目录（utils/logger.py -> utils -> project root）
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_LOG_DIR = _PROJECT_ROOT / "data" / "logs"
+DEFAULT_LOG_FILE = DEFAULT_LOG_DIR / "job_assistant.log"
+
+
+class SafeStreamHandler(logging.StreamHandler):
+    """控制台 Handler：GBK 终端无法编码的字符自动替换，避免 Logging error"""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            msg = self.format(record)
+            stream = self.stream
+            try:
+                stream.write(msg + self.terminator)
+            except UnicodeEncodeError:
+                enc = getattr(stream, "encoding", None) or "utf-8"
+                safe = msg.encode(enc, errors="replace").decode(enc, errors="replace")
+                stream.write(safe + self.terminator)
+            self.flush()
+        except Exception:
+            self.handleError(record)
+
 
 class ColorFormatter(logging.Formatter):
     """
@@ -163,7 +186,7 @@ def setup_logger(
 
     # 配置控制台输出处理器
     if console_output:
-        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler = SafeStreamHandler(sys.stdout)
         console_handler.setLevel(log_level)
         # 使用彩色格式化器包装基础格式
         color_formatter = ColorFormatter(formatter)
@@ -172,8 +195,9 @@ def setup_logger(
 
     # 配置文件输出处理器（按日期轮转）
     if file_output:
-        # 使用pathlib处理路径，自动创建不存在的目录
         log_path = Path(log_dir)
+        if not log_path.is_absolute():
+            log_path = _PROJECT_ROOT / log_path
         log_path.mkdir(parents=True, exist_ok=True)
 
         log_file = log_path / "job_assistant.log"

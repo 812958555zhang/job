@@ -12,11 +12,27 @@ import asyncio
 import json
 from typing import Any, Dict, List, Optional
 
-from browser_use import Agent
-
+from browser.agent_helpers import (
+    wait_for_page_ready,
+    extract_page_text,
+    get_page_url,
+    page_needs_login,
+)
 from core.models import JobInfo
 from core.llm_client import VolcengineLLMClient
 from utils.logger import get_logger
+
+
+def _normalize_jobs_list_result(content) -> list:
+    """将 LLM 返回的 JSON 内容规范化为岗位字典列表"""
+    if isinstance(content, list):
+        return content
+    if isinstance(content, dict):
+        for key in ("jobs", "items", "data", "job_list"):
+            value = content.get(key)
+            if isinstance(value, list):
+                return value
+    return []
 
 
 class JobScanner:
@@ -98,29 +114,28 @@ class JobScanner:
 
     async def _extract_dom(self) -> Optional[str]:
         """
-        提取当前页面的DOM结构化文本
+        提取当前页面的可见文本内容
 
-        Returns:
-            str: DOM结构化文本，失败返回 None
+        直接读取页面 DOM 文本，避免 Browser Use agent.run() 重新导航导致离开搜索页。
         """
         try:
-            agent = self._browser_agent._agent
-            if not agent:
-                self._logger.error("Browser Use Agent 未初始化")
+            page = self._browser_agent.get_page()
+            if not page:
+                self._logger.error("页面不可用")
                 return None
 
-            # 使用Browser Use的总结能力获取页面内容
-            # Browser Use会自动提取DOM并转换为结构化文本
-            result = await agent.run(
-                task="提取当前页面的岗位信息，包括岗位名称、公司名称、薪资、地点、经验要求、学历要求等",
-            )
+            content = await extract_page_text(page)
+            if not content:
+                self._logger.error("页面文本为空")
+                return None
 
-            if result and hasattr(result, 'content'):
-                content = str(result.content)
-                self._logger.debug(f"DOM提取成功，长度: {len(content)}字符")
-                return content
+            url = await get_page_url(page)
+            if page_needs_login(content, url):
+                self._logger.warning("当前页面需要登录 BOSS 直聘")
+                return None
 
-            return None
+            self._logger.debug(f"页面文本提取成功，长度: {len(content)}字符")
+            return content
 
         except Exception as e:
             self._logger.error(f"提取DOM失败: {e}", exc_info=True)
@@ -179,7 +194,7 @@ class JobScanner:
                 max_tokens=2000,
             )
 
-            jobs_data = result.get("content", [])
+            jobs_data = _normalize_jobs_list_result(result.get("content"))
             if not isinstance(jobs_data, list):
                 self._logger.warning("AI返回的数据不是列表格式")
                 return []
@@ -391,11 +406,7 @@ class JobScanner:
             if not page:
                 return False
 
-            # 等待页面加载完成
-            await page.wait_for_load_state("networkidle", timeout=timeout * 1000)
-
-            # 额外等待一下确保动态内容渲染
-            await asyncio.sleep(2)
+            await wait_for_page_ready(page, timeout=timeout)
 
             self._logger.info("页面动态内容加载完成")
             return True

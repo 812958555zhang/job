@@ -37,7 +37,7 @@ class DelaySimulator:
         typing_speed_max: 打字最大间隔毫秒（默认150）
         mouse_move_duration: 鼠标移动持续时间（默认0.5秒）
         adaptive_enabled: 是否启用自适应延迟（默认True）
-        daily_limit: 每日最大操作次数（默认50）
+        daily_limit: 每日最大操作次数（默认2）
     """
 
     # 默认配置常量
@@ -46,7 +46,7 @@ class DelaySimulator:
     DEFAULT_TYPING_MIN: int = 50      # 毫秒
     DEFAULT_TYPING_MAX: int = 150     # 毫秒
     DEFAULT_MOUSE_DURATION: float = 0.5
-    DEFAULT_DAILY_LIMIT: int = 50
+    DEFAULT_DAILY_LIMIT: int = 2
 
     def __init__(
         self,

@@ -47,6 +47,31 @@ def get_pipeline() -> ResumeParsingPipeline:
 # 空JSON模板（用于初始化编辑器）
 EMPTY_JSON_TEMPLATE = "{\n  \n}"
 
+
+def _is_empty_json_content(json_content) -> bool:
+    """判断 JSON 编辑器内容是否为空或未填写有效数据"""
+    if json_content is None:
+        return True
+    if isinstance(json_content, dict):
+        return len(json_content) == 0
+    text = str(json_content).strip()
+    if not text:
+        return True
+    if text == EMPTY_JSON_TEMPLATE.strip():
+        return True
+    if text in ("{}", "{\n}", "{\n\n}"):
+        return True
+    return False
+
+
+def _json_content_to_str(json_content) -> str:
+    """将 Gradio Code 组件的值统一转为 JSON 字符串"""
+    if json_content is None:
+        return ""
+    if isinstance(json_content, dict):
+        return json.dumps(json_content, ensure_ascii=False, indent=2)
+    return str(json_content)
+
 # 默认用户画像模板
 DEFAULT_PROFILE_TEMPLATE = {
     "name": "",
@@ -119,7 +144,8 @@ def on_parse_click(
             error_msg = result.get('error', '未知错误')
             error_status = f"❌ 解析失败: {error_msg}"
             stats_text = f"⏱️ 耗时: {elapsed_time:.1f}秒 | 📄 大小: {file_size_display} | ❌ 失败"
-            return error_status, stats_text, EMPTY_JSON_TEMPLATE
+            yield error_status, stats_text, EMPTY_JSON_TEMPLATE
+            return
 
         # ========== 步骤4：成功处理 ==========
         progress(1.0, desc="✅ 解析完成！")
@@ -133,12 +159,11 @@ def on_parse_click(
             warning_status = "⚠️ 解析完成但数据格式异常"
             raw_response = result.get('raw_response', {})
             json_content = json.dumps(raw_response, ensure_ascii=False, indent=2)
+            success_status = warning_status
         else:
             # 成功获取结构化数据
-            success_status = f"✅ 解析完成！姓名: {user_profile.name}"
-            # 将Pydantic模型转为字典再转JSON（排除时间戳字段）
+            success_status = f"✅ 解析完成！姓名: {user_profile.name}（已自动写入数据库，可编辑后点保存）"
             profile_dict = user_profile.model_dump()
-            # 移除不需要展示的字段
             profile_dict.pop('created_at', None)
             profile_dict.pop('updated_at', None)
             profile_dict.pop('resume_file_path', None)
@@ -153,12 +178,12 @@ def on_parse_click(
             f"🔤 Token: {tokens_used}"
         )
 
-        return success_status, stats_text, json_content
+        yield success_status, stats_text, json_content
 
     except Exception as e:
         # 兜底异常捕获
         error_status = f"💥 异常: {str(e)}"
-        return error_status, INITIAL_STATS, EMPTY_JSON_TEMPLATE
+        yield error_status, INITIAL_STATS, EMPTY_JSON_TEMPLATE
 
 
 def on_save_click(json_content: str, file_path: Optional[str]) -> str:
@@ -166,25 +191,26 @@ def on_save_click(json_content: str, file_path: Optional[str]) -> str:
     点击"保存画像"按钮的回调函数
 
     将JSON编辑器中的内容保存到数据库和本地备份文件，
-    支持用户手动编辑后的数据保存。
-
-    Args:
-        json_content: JSON编辑器中的当前文本内容（可能已被用户修改）
-        file_path: 原始简历文件路径（用于日志记录）
-
-    Returns:
-        str: 操作结果的状态消息
+    支持用户手动编辑后的数据保存。若编辑器为空，会尝试使用最近一次解析结果。
     """
-    # ========== 步骤1：验证输入 ==========
-    if not json_content or json_content.strip() == EMPTY_JSON_TEMPLATE.strip():
-        return "❌ 请先解析简历或填写有效的画像数据"
+    json_text = _json_content_to_str(json_content)
 
-    # ========== 步骤2：尝试解析JSON ==========
+    # 编辑器为空时，尝试从 Pipeline 缓存读取最近一次解析结果
+    if _is_empty_json_content(json_text):
+        pipeline = get_pipeline()
+        cached_json = pipeline.get_profile_as_json()
+        if cached_json:
+            json_text = cached_json
+        else:
+            return "❌ 请先点击「开始解析」完成简历解析，或在下方 JSON 编辑器中填写有效数据"
+
     try:
-        # 尝试将字符串解析为Python字典
-        data = json.loads(json_content)
+        data = json.loads(json_text)
     except json.JSONDecodeError as e:
         return f"❌ JSON格式错误: {str(e)}（请检查括号、引号是否匹配）"
+
+    if not isinstance(data, dict):
+        return "❌ 画像数据必须是 JSON 对象格式"
 
     # ========== 步骤3：验证必填字段 ==========
     required_fields = ['name', 'education', 'total_experience_years']
