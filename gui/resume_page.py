@@ -246,7 +246,7 @@ def on_save_click(json_content: str, file_path: Optional[str]) -> str:
 
     # ========== 步骤6：保存JSON备份文件 ==========
     try:
-        backup_path = pipeline._save_json_backup(data, user_profile.model_dump())
+        backup_path = pipeline._save_json_backup(data, user_profile.model_dump(mode='json'))
         if backup_path:
             backup_filename = Path(backup_path).name
     except Exception:
@@ -413,8 +413,7 @@ def create_resume_page():
         language="json",
         value=EMPTY_JSON_TEMPLATE,
         interactive=True,
-        lines=20,
-        show_copy_button=True  # 显示复制按钮方便用户操作
+        lines=20
     )
 
     # ========== 区域3：字段说明参考表 ==========

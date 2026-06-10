@@ -227,7 +227,6 @@ def start_automation_task(daily_limit: int, match_threshold: float):
 
         except Exception as e:
             _logger.error(f"💥 自动化任务异常: {e}", exc_info=True)
-            global _is_running
             _is_running = False
 
     # 启动任务线程
@@ -297,14 +296,14 @@ def create_main_panel():
             )
             pause_btn = gr.Button(
                 "⏸️ 暂停",
-                variant="secondary",
-                disabled=True
+                variant="secondary"
             )
+            pause_btn.interactive = False
             stop_btn = gr.Button(
                 "⏹️ 停止",
-                variant="stop",
-                disabled=True
+                variant="stop"
             )
+            stop_btn.interactive = False
 
         # 状态显示区
         with gr.Column(scale=2):
@@ -405,8 +404,8 @@ def create_main_panel():
     )
 
     # 定时刷新统计数据
-    gr.Timer(
-        interval=2,
+    timer = gr.Timer(value=2.0)
+    timer.tick(
         fn=update_stats,
         outputs=[total_count, matched_count, replied_count, skipped_count, reply_rate]
     )

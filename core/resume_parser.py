@@ -966,7 +966,7 @@ class VolcengineVisionClient:
                 }
 
                 # 发送HTTP请求
-                response = self._send_request("/v1/chat/completions", payload)
+                response = self._send_request("/chat/completions", payload)
 
                 # 检查HTTP状态码决定是否可重试
                 status_code = response.get('status_code')
@@ -1073,7 +1073,7 @@ class VolcengineVisionClient:
         设置标准请求头并记录详细的请求/响应日志。
 
         Args:
-            endpoint: API路径（如"/v1/chat/completions"）
+            endpoint: API路径（如"/chat/completions"）
             payload: 请求体字典（符合OpenAI Chat Completions API格式）
 
         Returns:
@@ -1092,6 +1092,7 @@ class VolcengineVisionClient:
         url = f"{self.base_url}{endpoint}"
 
         # 设置标准请求头
+        # 火山引擎Ark API使用标准的 Authorization: Bearer 格式进行认证
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.api_key}",
@@ -1483,10 +1484,10 @@ class ResumeParsingPipeline:
             else:
                 self.logger.warning("数据库保存失败（不影响主流程）")
 
-            # 5b. 保存JSON备份
+            # 5b. 保存JSON备份（mode='json'确保datetime等字段转为ISO字符串）
             backup_path = self._save_json_backup(
                 self._raw_ai_response or {},
-                user_profile.model_dump() if user_profile else {}
+                user_profile.model_dump(mode='json') if user_profile else {}
             )
             if backup_path:
                 self.logger.info(f"JSON备份保存成功: {backup_path}")
@@ -1820,8 +1821,10 @@ class ResumeParsingPipeline:
             }
 
             # 写入JSON文件（UTF-8编码，不转义Unicode字符）
+            # 使用自定义default处理器处理datetime等非JSON原生类型
             with open(file_path, 'w', encoding='utf-8') as f:
-                json.dump(backup_content, f, ensure_ascii=False, indent=2)
+                json.dump(backup_content, f, ensure_ascii=False, indent=2,
+                          default=lambda o: o.isoformat() if hasattr(o, 'isoformat') else str(o))
 
             absolute_path = str(file_path.resolve())
             self.logger.info(f"JSON备份文件保存成功: {absolute_path}")

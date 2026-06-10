@@ -11,7 +11,7 @@ utils 模块 - 工具函数和通用组件集合
 # 导出核心工具模块
 from .logger import setup_logger, get_logger, set_log_level
 from .config_loader import get_config, load_settings, load_api_config
-from .db_helper import DBHelper, get_db_helper
+from .db_helper import DatabaseHelper as DBHelper, get_db as get_db_helper
 from .delay_simulator import (
     DelaySimulator,
     get_simulator,

@@ -44,19 +44,7 @@ def main():
     try:
         # 创建各页面组件
         with gr.Blocks(
-            title="BOSS直聘求职助手",
-            theme=gr.themes.Soft(),
-            css="""
-            .main-title {
-                text-align: center;
-                font-size: 24px;
-                font-weight: bold;
-                margin-bottom: 20px;
-            }
-            .status-running { color: green; }
-            .status-stopped { color: red; }
-            .status-paused { color: orange; }
-            """
+            title="BOSS直聘求职助手"
         ) as demo:
             # 应用标题
             gr.Markdown("# 🤖 BOSS直聘智能求职助手")

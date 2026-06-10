@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Union
 
 from browser_use import Agent
-from openai import OpenAI
+from browser_use.llm import ChatOpenAI
 from playwright.async_api import Browser as AsyncBrowser
 from playwright.async_api import Page as AsyncPage
 
@@ -182,7 +182,7 @@ class BrowserAgent:
     属性:
         _agent: Browser Use Agent 实例
         _browser: Playwright 异步浏览器实例
-        _llm_client: OpenAI 兼容的 LLM 客户端
+        _llm_client: browser-use ChatOpenAI LLM 客户端（封装 AsyncOpenAI）
         _session_manager: 会话状态管理器
         _config: 合并后的配置字典
     """
@@ -333,15 +333,16 @@ class BrowserAgent:
 
         return default_config
 
-    def _init_llm_client(self) -> OpenAI:
+    def _init_llm_client(self) -> ChatOpenAI:
         """
-        初始化 LLM 客户端（OpenAI 兼容协议）
+        初始化 LLM 客户端（browser-use ChatOpenAI）
 
-        使用火山引擎豆包 API，通过 OpenAI SDK 对接。
-        支持从配置文件自动读取 API Key 和模型名称。
+        使用火山引擎豆包 API，通过 browser-use 的 ChatOpenAI 封装对接。
+        ChatOpenAI 继承 BaseChatModel，提供 provider 属性和异步调用能力，
+        是 Browser Use Agent 要求的标准 LLM 接口。
 
         Returns:
-            OpenAI: 已配置好的客户端实例
+            ChatOpenAI: 已配置好的 LLM 实例（带 provider 属性）
         """
         llm_cfg = self._config.get("llm_config", {})
 
@@ -360,14 +361,15 @@ class BrowserAgent:
                 "⚠️ LLM API Key 未配置！Browser Use Agent 将无法正常工作"
             )
 
-        client = OpenAI(
+        # 使用 browser-use 的 ChatOpenAI（继承 BaseChatModel，带 provider 属性）
+        client = ChatOpenAI(
+            model=llm_cfg.get("model_name", "GLM-5.1"),
             api_key=api_key,
             base_url=llm_cfg.get("api_base_url", ""),
         )
 
-        model_name = llm_cfg.get("model_name", "GLM-5.1")
         self._logger.info(
-            f"✓ LLM 客户端初始化完成 | 模型: {model_name} | "
+            f"✓ LLM 客户端初始化完成 | 模型: {client.model} | "
             f"Base URL: {llm_cfg.get('api_base_url', '')}"
         )
 

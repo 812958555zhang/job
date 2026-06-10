@@ -259,9 +259,10 @@ class ProfileManager:
             output_path = Path(file_path)
             output_path.parent.mkdir(parents=True, exist_ok=True)
 
-            # 导出为JSON格式
+            # 导出为JSON格式（mode='json'确保datetime等字段转为ISO字符串）
             with open(file_path, 'w', encoding='utf-8') as f:
-                json.dump(profile.model_dump(), f, ensure_ascii=False, indent=2)
+                json.dump(profile.model_dump(mode='json'), f, ensure_ascii=False, indent=2,
+                          default=lambda o: o.isoformat() if hasattr(o, 'isoformat') else str(o))
 
             logger.info(f"用户画像导出成功, ID={profile_id}, 文件={file_path}")
             return True
