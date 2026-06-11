@@ -12,6 +12,11 @@ import threading
 from typing import Optional, Tuple
 
 from browser.agent import BrowserAgent
+from browser.agent_edge import (
+    EDGE_DEBUG_PORT,
+    EDGE_MANUAL_START_HINT,
+    check_edge_cdp_sync,
+)
 from core.automation_engine import run_automation_loop
 from core.profile_manager import get_profile_manager
 from utils.logger import get_logger
@@ -41,6 +46,9 @@ _logger = get_logger(__name__)
 # 任务线程
 _task_thread: Optional[threading.Thread] = None
 
+# GUI 状态（后台线程失败时由定时器同步到界面）
+_ui_status = "⏹️ 已停止"
+
 
 # ==================== 核心回调函数 ====================
 
@@ -64,7 +72,7 @@ def on_start_click(
     Returns:
         tuple: (状态文本, 启动按钮状态, 暂停按钮状态, 停止按钮状态)
     """
-    global _browser_agent, _is_running, _is_paused, _task_thread
+    global _browser_agent, _is_running, _is_paused, _task_thread, _ui_status
 
     if _is_running and not _is_paused:
         return "⚠️ 自动化任务已在运行中", "disabled", "enabled", "enabled"
@@ -75,6 +83,7 @@ def on_start_click(
         if _browser_agent:
             _browser_agent._paused = False
         _logger.info("▶️ 自动化任务已继续")
+        _ui_status = "▶️ 自动化任务已继续"
         return "▶️ 自动化任务已继续", "disabled", "enabled", "enabled"
 
     profile = get_profile_manager().get_active_profile()
@@ -84,21 +93,34 @@ def on_start_click(
             "enabled", "disabled", "disabled",
         )
 
+    if not check_edge_cdp_sync():
+        _logger.warning("启动前未检测到 Edge CDP: %s", EDGE_MANUAL_START_HINT)
+        return (
+            f"❌ 未检测到 Edge（端口 {EDGE_DEBUG_PORT}）。"
+            "请先运行项目目录下的 start_edge.bat 启动 Edge，再点击「启动自动求职」。",
+            "enabled",
+            "disabled",
+            "disabled",
+        )
+
     try:
         _is_running = True
         _is_paused = False
+        _ui_status = "▶️ 正在连接 Edge..."
 
         _logger.info("🚀 正在启动自动化求职任务...")
 
         simulator = get_simulator()
         simulator.set_delay_range(delay_min, delay_max)
 
-        _browser_agent = BrowserAgent()
+        if _browser_agent is None:
+            _browser_agent = BrowserAgent()
         start_automation_task(daily_limit, match_threshold, profile)
-        return "▶️ 自动化任务已启动（浏览器初始化中）", "disabled", "enabled", "enabled"
+        return "▶️ 自动化任务已启动（连接 Edge 中）", "disabled", "enabled", "enabled"
 
     except Exception as e:
         _is_running = False
+        _ui_status = f"❌ 启动失败: {str(e)}"
         _logger.error(f"💥 启动自动化任务失败: {e}", exc_info=True)
         return f"❌ 启动失败: {str(e)}", "enabled", "disabled", "disabled"
 
@@ -112,7 +134,7 @@ def on_pause_click() -> Tuple[str, str, str, str]:
     Returns:
         tuple: (状态文本, 启动按钮状态, 暂停按钮状态, 停止按钮状态)
     """
-    global _is_paused
+    global _is_paused, _ui_status
 
     if not _is_running:
         return "⏹️ 任务未运行", "enabled", "disabled", "disabled"
@@ -124,6 +146,7 @@ def on_pause_click() -> Tuple[str, str, str, str]:
         _browser_agent._paused = True
         _logger.info("⏸️ 自动化任务已暂停")
 
+    _ui_status = "⏸️ 自动化任务已暂停"
     return "⏸️ 自动化任务已暂停", "enabled", "disabled", "enabled"
 
 
@@ -136,7 +159,7 @@ def on_stop_click() -> Tuple[str, str, str, str]:
     Returns:
         tuple: (状态文本, 启动按钮状态, 暂停按钮状态, 停止按钮状态)
     """
-    global _is_running, _is_paused, _browser_agent, _task_thread
+    global _is_running, _is_paused, _browser_agent, _task_thread, _ui_status
 
     if not _is_running:
         return "⏹️ 任务未运行", "enabled", "disabled", "disabled"
@@ -158,6 +181,7 @@ def on_stop_click() -> Tuple[str, str, str, str]:
         _task_thread = None
 
         _logger.info("✅ 自动化任务已完全停止")
+        _ui_status = "⏹️ 自动化任务已停止"
         return "⏹️ 自动化任务已停止", "enabled", "disabled", "disabled"
 
     except Exception as e:
@@ -181,11 +205,12 @@ def start_automation_task(daily_limit: int, match_threshold: float, user_profile
 
     def task_loop():
         """自动化任务主循环"""
-        global _is_running, _today_stats
+        global _is_running, _today_stats, _ui_status
 
         async def _run_all():
             if not _browser_agent._running:
                 await _browser_agent.async_start()
+                _ui_status = "▶️ 自动化任务运行中"
                 _logger.info("✅ BrowserAgent 启动成功")
             return await run_automation_loop(
                 browser_agent=_browser_agent,
@@ -206,21 +231,29 @@ def start_automation_task(daily_limit: int, match_threshold: float, user_profile
             final_stats = asyncio.run(_run_all())
 
             _today_stats.update(final_stats)
+            _ui_status = "✅ 任务已完成"
             _logger.info(
                 f"📊 任务完成 | 沟通: {final_stats['matched_count']} | "
                 f"跳过: {final_stats['skipped_count']}"
             )
 
         except Exception as e:
+            err = str(e)
+            if len(err) > 100:
+                err = err[:97] + "..."
+            _ui_status = f"❌ 任务失败: {err}"
             _logger.error(f"💥 自动化任务异常: {e}", exc_info=True)
         finally:
             _is_running = False
+            if _ui_status.startswith(("▶️", "⏸️")):
+                _ui_status = "⏹️ 任务已结束"
+            # 任务结束时不关闭 Edge，便于用户继续登录或手动操作
             if _browser_agent and _browser_agent._running:
                 try:
-                    _browser_agent.stop()
-                    _logger.info("🛑 BrowserAgent 已停止")
+                    _browser_agent._running = False
+                    _logger.info("自动化任务已结束，Edge 浏览器窗口保持打开")
                 except Exception as stop_err:
-                    _logger.warning(f"停止 BrowserAgent 时出错: {stop_err}")
+                    _logger.warning(f"重置 BrowserAgent 状态时出错: {stop_err}")
 
     _task_thread = threading.Thread(target=task_loop, daemon=True)
     _task_thread.start()
@@ -267,6 +300,14 @@ def update_stats() -> Tuple[int, int, int, int, float]:
     return (total, matched, replied, skipped, round(reply_rate, 1))
 
 
+def get_task_ui_state() -> Tuple[str, str, str, str]:
+    """同步任务状态与按钮可用性（供定时器刷新）"""
+    if _is_running:
+        pause = "disabled" if _is_paused else "enabled"
+        return _ui_status, "disabled", pause, "enabled"
+    return _ui_status, "enabled", "disabled", "disabled"
+
+
 # ==================== 页面构建函数 ====================
 
 def create_main_panel():
@@ -277,6 +318,10 @@ def create_main_panel():
         None（直接渲染到父级容器）
     """
     gr.Markdown("### 🎯 任务控制")
+    gr.Markdown(
+        "**Edge 浏览器：** 请先双击项目根目录 `start_edge.bat` 启动 Edge，"
+        "再在下方点击「启动自动求职」。（启动本应用不会自动打开 Edge）"
+    )
 
     with gr.Row():
         # 控制按钮组
@@ -400,4 +445,8 @@ def create_main_panel():
     timer.tick(
         fn=update_stats,
         outputs=[total_count, matched_count, replied_count, skipped_count, reply_rate]
+    )
+    timer.tick(
+        fn=get_task_ui_state,
+        outputs=[status_text, start_btn, pause_btn, stop_btn],
     )

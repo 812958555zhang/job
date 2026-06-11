@@ -100,6 +100,51 @@ def _mask_api_key(api_key: str) -> str:
     return f"{api_key[:8]}...{api_key[-4:]}"
 
 
+def _strip_markdown_json_fence(text: str) -> str:
+    """去掉模型可能包裹的 ```json 代码块"""
+    text = (text or "").strip()
+    if not text.startswith("```"):
+        return text
+    lines = text.splitlines()
+    if lines and lines[0].startswith("```"):
+        lines = lines[1:]
+    if lines and lines[-1].strip() == "```":
+        lines = lines[:-1]
+    return "\n".join(lines).strip()
+
+
+def _repair_truncated_json_array(text: str):
+    """
+    尝试修复被 max_tokens 截断的 JSON 数组（保留最后一个完整对象）
+    """
+    text = _strip_markdown_json_fence(text)
+    start = text.find("[")
+    if start < 0:
+        return None
+    text = text[start:]
+    last_obj_end = text.rfind("}")
+    if last_obj_end <= 0:
+        return None
+    candidate = text[: last_obj_end + 1].rstrip().rstrip(",") + "]"
+    try:
+        return json.loads(candidate)
+    except json.JSONDecodeError:
+        return None
+
+
+def _parse_model_json(content_text: str, logger) -> Any:
+    """解析模型 JSON 输出，截断时尽量 salvage 部分结果"""
+    text = _strip_markdown_json_fence(content_text)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as exc:
+        repaired = _repair_truncated_json_array(content_text)
+        if repaired is not None:
+            logger.warning("模型 JSON 输出被截断，已自动修复并解析部分结果")
+            return repaired
+        raise exc
+
+
 def _is_retryable_error(error: Exception) -> bool:
     """
     判断异常是否属于可重试类型
@@ -240,7 +285,7 @@ class VolcengineLLMClient:
     """
 
     # 默认配置常量
-    DEFAULT_TIMEOUT: float = 60.0  # 默认请求超时时间（秒）
+    DEFAULT_TIMEOUT: float = 90.0  # 默认请求超时时间（秒）
     DEFAULT_TEMPERATURE: float = 0.7  # 默认温度参数
     DEFAULT_MAX_TOKENS: int = 2000  # 默认最大输出 token 数
     MAX_RETRIES: int = 3  # 最大重试次数
@@ -292,8 +337,10 @@ class VolcengineLLMClient:
         self.vision_model: str = models_config.get("vision", "GLM-5.1")
         self.lite_model: str = models_config.get("lite", "GLM-5.1")
 
-        # 超时设置
-        self.timeout: float = timeout or self.DEFAULT_TIMEOUT
+        # 超时设置（构造参数 > 配置文件 > 默认值）
+        self.timeout: float = float(
+            timeout or volc_config.get("timeout") or self.DEFAULT_TIMEOUT
+        )
 
         # 安全检查：API Key 为空或占位符时发出警告
         if not self.api_key or self.api_key in ["your-api-key", "", "none"]:
@@ -683,10 +730,9 @@ class VolcengineLLMClient:
             max_tokens=max_tokens,
         )
 
-        # 尝试解析 JSON 内容
+        # 尝试解析 JSON 内容（截断时自动修复）
         try:
-            content_text = raw_result["content"]
-            parsed_content = json.loads(content_text)
+            parsed_content = _parse_model_json(raw_result["content"], self._logger)
 
             # 返回解析后的结果（替换原 content 为 dict）
             return {
@@ -917,8 +963,7 @@ class VolcengineLLMClient:
         )
 
         try:
-            content_text = raw_result["content"]
-            parsed_content = json.loads(content_text)
+            parsed_content = _parse_model_json(raw_result["content"], self._logger)
 
             return {
                 **raw_result,

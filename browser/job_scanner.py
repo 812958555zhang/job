@@ -118,28 +118,42 @@ class JobScanner:
 
         直接读取页面 DOM 文本，避免 Browser Use agent.run() 重新导航导致离开搜索页。
         """
-        try:
-            page = self._browser_agent.get_page()
-            if not page:
-                self._logger.error("页面不可用")
-                return None
-
-            content = await extract_page_text(page)
-            if not content:
-                self._logger.error("页面文本为空")
-                return None
-
-            url = await get_page_url(page)
-            if page_needs_login(content, url):
-                self._logger.warning("当前页面需要登录 BOSS 直聘")
-                return None
-
-            self._logger.debug(f"页面文本提取成功，长度: {len(content)}字符")
-            return content
-
-        except Exception as e:
-            self._logger.error(f"提取DOM失败: {e}", exc_info=True)
+        page = self._browser_agent.get_page()
+        if not page:
+            self._logger.error("页面不可用")
             return None
+
+        for attempt in range(3):
+            try:
+                content = await extract_page_text(page, retries=2)
+                if not content:
+                    self._logger.error("页面文本为空")
+                    return None
+
+                url = await get_page_url(page)
+                if page_needs_login(content, url):
+                    self._logger.warning("当前页面需要登录 BOSS 直聘")
+                    return None
+
+                self._logger.debug(f"页面文本提取成功，长度: {len(content)}字符")
+                return content
+            except Exception as e:
+                err_msg = str(e).lower()
+                if attempt < 2 and any(
+                    token in err_msg
+                    for token in ("destroyed", "navigation", "execution context")
+                ):
+                    self._logger.warning(
+                        "页面正在跳转，%ss 后重试提取 DOM (%s/3)",
+                        1.5 * (attempt + 1),
+                        attempt + 2,
+                    )
+                    await asyncio.sleep(1.5 * (attempt + 1))
+                    page = self._browser_agent.get_page() or page
+                    continue
+                self._logger.error(f"提取DOM失败: {e}", exc_info=True)
+                return None
+        return None
 
     async def _parse_dom_with_ai(self, dom_text: str) -> List[JobInfo]:
         """
@@ -171,18 +185,19 @@ class JobScanner:
   - url: 岗位详情页URL（无法提取时为null）
 
 注意事项：
-1. 只提取岗位列表信息，忽略其他无关内容
-2. 薪资范围需要分开提取最低和最高值
-3. 如果某个字段无法从页面中找到，设为null
-4. 确保输出是纯粹的JSON数组，不要包含任何其他文本
+1. 只提取岗位列表信息，忽略导航栏、页脚等无关内容
+2. 最多提取前 12 个岗位，字段保持简短
+3. 薪资范围需要分开提取最低和最高值
+4. 如果某个字段无法从页面中找到，设为 null
+5. 确保输出是纯粹的 JSON 数组，不要包含任何其他文本
         """.strip()
 
         user_prompt = f"""
-请分析以下网页内容，提取所有岗位信息：
+请分析以下网页内容，提取岗位信息（最多 12 个）：
 
-{dom_text[:3000]}
+{dom_text[:2500]}
 
-请输出JSON格式的岗位列表。
+请输出 JSON 格式的岗位列表。
         """.strip()
 
         try:
@@ -190,8 +205,9 @@ class JobScanner:
             result = await self._llm_client.achat_json(
                 message=user_prompt,
                 system_prompt=system_prompt,
-                temperature=0.1,  # 结构化输出使用低温度
-                max_tokens=2000,
+                model=self._llm_client.lite_model,
+                temperature=0.1,
+                max_tokens=4096,
             )
 
             jobs_data = _normalize_jobs_list_result(result.get("content"))
@@ -308,12 +324,24 @@ class JobScanner:
                 job_id = f"job_{hashlib.md5(hash_str.encode()).hexdigest()[:8]}"
                 data["job_id"] = job_id
 
+            tags = data.get("tags")
+            if not isinstance(tags, list):
+                tags = []
+
+            def _to_int_salary(value):
+                if value is None:
+                    return None
+                try:
+                    return int(round(float(value)))
+                except (TypeError, ValueError):
+                    return None
+
             return JobInfo(
                 job_id=data["job_id"],
                 job_name=data.get("job_name", ""),
                 company_name=data.get("company_name", ""),
-                salary_min=data.get("salary_min"),
-                salary_max=data.get("salary_max"),
+                salary_min=_to_int_salary(data.get("salary_min")),
+                salary_max=_to_int_salary(data.get("salary_max")),
                 salary_description=data.get("salary_description"),
                 job_description=data.get("job_description"),
                 experience_required=data.get("experience_required"),
@@ -321,7 +349,7 @@ class JobScanner:
                 location=data.get("location"),
                 company_size=data.get("company_size"),
                 industry=data.get("industry"),
-                tags=data.get("tags", []),
+                tags=tags,
                 url=data.get("url"),
             )
         except Exception as e:

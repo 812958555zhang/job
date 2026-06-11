@@ -5,8 +5,34 @@ Browser Use Agent 辅助函数
 """
 
 import asyncio
+import time
 from dataclasses import dataclass
 from typing import Any, Optional
+
+
+STEALTH_INIT_SCRIPT = """
+Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+window.chrome = window.chrome || { runtime: {} };
+Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en-US', 'en'] });
+Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+delete window.__playwright;
+delete window.__pw_manual;
+"""
+
+
+async def apply_stealth_context(context: Any) -> None:
+    """注入反检测脚本，降低 BOSS 直聘识别 Playwright 的概率"""
+    if context is None or not hasattr(context, "add_init_script"):
+        return
+    try:
+        await context.add_init_script(STEALTH_INIT_SCRIPT)
+    except Exception:
+        pass
+
+
+def _is_blank_url(url: str) -> bool:
+    url = (url or "").lower().strip()
+    return not url or url in ("about:blank", "chrome://newtab/", "edge://newtab/")
 
 
 @dataclass
@@ -60,17 +86,14 @@ async def navigate_page(
     if page is None:
         return False
 
-    # 执行导航 - Playwright 使用 wait_until="networkidle" 确保页面真正加载
+    wait_until = "domcontentloaded"
     if hasattr(page, "goto"):
         try:
-            # 使用 networkidle 确保页面网络请求完成
-            await page.goto(url, wait_until="networkidle", timeout=60000)
+            await page.goto(url, wait_until=wait_until, timeout=60000)
         except Exception:
-            # 如果失败，尝试更宽松的选项
             try:
-                await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                await page.goto(url, wait_until="commit", timeout=60000)
             except Exception:
-                # 最后一次尝试，不等待
                 try:
                     await page.goto(url)
                 except Exception:
@@ -107,6 +130,22 @@ async def navigate_page(
         return False
     except Exception:
         return False
+
+
+async def wait_for_context_pages(
+    context: Any, timeout: float = 30.0, poll_interval: float = 0.5
+) -> Optional[Any]:
+    """等待 CDP 连接后浏览器上下文出现至少一个可用标签页"""
+    if context is None or not hasattr(context, "pages"):
+        return None
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        pages = [p for p in context.pages if not p.is_closed()]
+        if pages:
+            return pages[0]
+        await asyncio.sleep(poll_interval)
+    return None
 
 
 async def pick_zhipin_page(
@@ -189,30 +228,59 @@ async def any_zhipin_page_open(context: Any) -> bool:
     return False
 
 
-async def open_single_login_tab(context: Any, login_url: str) -> Any:
+def _is_boss_login_url(url: str, login_url: str = "") -> bool:
+    """是否为 BOSS 直聘登录页"""
+    url = (url or "").lower()
+    if "about:blank" in url or "zhipin.com" not in url:
+        return False
+    if "/web/user" in url or "login.zhipin.com" in url:
+        return True
+    hint = (login_url or "").split("?")[0].rstrip("/").lower()
+    return bool(hint and hint in url)
+
+
+async def ensure_zhipin_login_page(context: Any, login_url: str) -> Any:
     """
-    关闭多余标签，保留一个标签并打开登录页（仅启动时调用一次）
+    在已有标签页打开 BOSS 登录页（不 new_page，避免触发反爬 & 焦点切到 blank 标签）
     """
     if context is None:
         return None
 
-    pages = [p for p in context.pages if not p.is_closed()]
-    if pages:
-        page = pages[0]
-        for extra in pages[1:]:
-            try:
-                await extra.close()
-            except Exception:
-                pass
-    else:
-        page = await context.new_page()
+    await apply_stealth_context(context)
+    await wait_for_context_pages(context, timeout=15.0)
 
-    for attempt in range(3):
-        await navigate_page(page, login_url, wait_seconds=1.5, focus=False)
+    live = [p for p in context.pages if not p.is_closed()]
+    page = live[0] if live else None
+    if page is None:
+        try:
+            page = await context.new_page()
+        except Exception:
+            return None
+
+    login_hint = login_url or "https://www.zhipin.com/web/user/?ka=header-login"
+    for attempt in range(5):
+        try:
+            await page.goto(
+                login_hint,
+                wait_until="domcontentloaded",
+                timeout=60000,
+                referer="https://www.zhipin.com/",
+            )
+            await asyncio.sleep(3.0)
+        except Exception:
+            await navigate_page(page, login_hint, wait_seconds=2.0, focus=False)
+
         url = await get_page_url(page)
-        if "zhipin.com" in url:
+        if _is_boss_login_url(url, login_url):
+            if hasattr(page, "bring_to_front"):
+                try:
+                    await page.bring_to_front()
+                except Exception:
+                    pass
             return page
-        await asyncio.sleep(1.0)
+        if "zhipin.com" in url and not _is_blank_url(url):
+            return page
+        await asyncio.sleep(2.0)
 
     return page
 
@@ -263,6 +331,50 @@ async def get_page_title(page: Any) -> str:
     return str(title) if title else ""
 
 
+async def click_next_page_playwright(page: Any) -> bool:
+    """BOSS 直聘翻页：优先改 URL 参数，其次点击分页按钮"""
+    if page is None:
+        return False
+
+    from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
+
+    current_url = await get_page_url(page)
+    if "zhipin.com" in current_url and "/jobs" in current_url:
+        parsed = urlparse(current_url)
+        qs = parse_qs(parsed.query, keep_blank_values=True)
+        current_page = int((qs.get("page") or ["1"])[0])
+        qs["page"] = [str(current_page + 1)]
+        flat_qs = {k: v[0] if len(v) == 1 else v for k, v in qs.items()}
+        new_query = urlencode(flat_qs, doseq=True)
+        new_url = urlunparse(parsed._replace(query=new_query))
+        await navigate_page(page, new_url, wait_seconds=2.5)
+        return True
+
+    selectors = (
+        ".options-pages a.next",
+        ".options-pages .next",
+        "div.turn-page a.next",
+        ".pagination a.next",
+    )
+    for sel in selectors:
+        try:
+            if hasattr(page, "locator"):
+                loc = page.locator(sel).first
+                if await loc.count() > 0:
+                    await loc.click(timeout=3000)
+                    await asyncio.sleep(2)
+                    return True
+            elif hasattr(page, "query_selector"):
+                el = await page.query_selector(sel)
+                if el:
+                    await el.click()
+                    await asyncio.sleep(2)
+                    return True
+        except Exception:
+            continue
+    return False
+
+
 async def scroll_page(page: Any, pixels: Optional[int] = None) -> bool:
     """向下滚动页面"""
     if page is None:
@@ -281,17 +393,201 @@ async def scroll_page(page: Any, pixels: Optional[int] = None) -> bool:
     return False
 
 
+_SCROLL_LAZY_CONTENT_JS = """
+async ({ steps, pauseMs }) => {
+  const pickScrollEl = () => {
+    const selectors = [
+      '.job-list-box',
+      '.search-job-result',
+      '.job-list',
+      '.rec-job-list',
+    ];
+    for (const sel of selectors) {
+      const el = document.querySelector(sel);
+      if (el && el.scrollHeight > el.clientHeight + 80) {
+        return el;
+      }
+    }
+    return document.scrollingElement || document.documentElement || document.body;
+  };
+
+  const el = pickScrollEl();
+  const viewHeight = el.clientHeight || window.innerHeight || 600;
+  const step = Math.max(viewHeight * 0.75, 350);
+
+  for (let i = 0; i < steps; i++) {
+    el.scrollBy(0, step);
+    window.scrollBy(0, Math.round(step * 0.25));
+    await new Promise((resolve) => setTimeout(resolve, pauseMs));
+  }
+
+  el.scrollTo(0, 0);
+  window.scrollTo(0, 0);
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  return true;
+}
+"""
+
+
+async def scroll_to_load_lazy_content(
+    page: Any,
+    steps: int = 6,
+    pause: float = 0.6,
+) -> bool:
+    """用鼠标滚轮分步滚动岗位列表，触发 BOSS 懒加载（比 scrollBy 更接近人工操作）"""
+    if page is None:
+        return False
+
+    await asyncio.sleep(0.4)
+    list_selectors = (
+        ".job-list-box",
+        ".search-job-result",
+        ".job-list",
+        ".rec-job-list",
+    )
+    scrolled = False
+
+    if hasattr(page, "locator") and hasattr(page, "mouse"):
+        for sel in list_selectors:
+            try:
+                loc = page.locator(sel).first
+                if await loc.count() == 0:
+                    continue
+                box = await loc.bounding_box()
+                if not box:
+                    continue
+                cx = box["x"] + box["width"] / 2
+                cy = box["y"] + min(box["height"] / 2, 420)
+                await page.mouse.move(cx, cy)
+                for _ in range(max(1, steps)):
+                    await page.mouse.wheel(0, 700)
+                    await asyncio.sleep(pause)
+                scrolled = True
+                break
+            except Exception:
+                continue
+
+        if not scrolled:
+            try:
+                viewport = page.viewport_size or {"width": 1280, "height": 720}
+                await page.mouse.move(
+                    viewport["width"] // 2,
+                    viewport["height"] // 2,
+                )
+                for _ in range(max(1, steps)):
+                    await page.mouse.wheel(0, 700)
+                    await asyncio.sleep(pause)
+                scrolled = True
+            except Exception:
+                pass
+
+    if not scrolled and hasattr(page, "evaluate"):
+        try:
+            await page.evaluate(
+                _SCROLL_LAZY_CONTENT_JS,
+                {"steps": max(1, steps), "pauseMs": int(max(pause, 0.3) * 1000)},
+            )
+            scrolled = True
+        except Exception:
+            for _ in range(max(1, steps)):
+                await scroll_page(page)
+                await asyncio.sleep(pause)
+            scrolled = True
+
+    if hasattr(page, "evaluate"):
+        try:
+            await page.evaluate(
+                """
+                () => {
+                  for (const sel of ['.job-list-box', '.search-job-result', '.job-list']) {
+                    const el = document.querySelector(sel);
+                    if (el) el.scrollTop = 0;
+                  }
+                  window.scrollTo(0, 0);
+                }
+                """
+            )
+        except Exception:
+            pass
+
+    await asyncio.sleep(0.5)
+    return scrolled
+
+
+async def count_job_cards(page: Any) -> int:
+    """统计当前页面可见岗位卡片数量"""
+    if page is None or not hasattr(page, "evaluate"):
+        return 0
+    try:
+        return int(
+            await page.evaluate(
+                """
+                () => {
+                  const sels = ['.job-card-wrapper', '.job-card-box', '.job-list-box .job-card'];
+                  for (const sel of sels) {
+                    const n = document.querySelectorAll(sel).length;
+                    if (n > 0) return n;
+                  }
+                  return 0;
+                }
+                """
+            )
+        )
+    except Exception:
+        return 0
+
+
+async def wait_for_job_cards(
+    page: Any,
+    min_count: int = 3,
+    timeout: float = 30.0,
+) -> bool:
+    """等待岗位卡片渲染完成（避免页面只有导航栏时就开始扫描）"""
+    if page is None:
+        return False
+
+    deadline = time.time() + max(1.0, timeout)
+    while time.time() < deadline:
+        count = await count_job_cards(page)
+        if count >= min_count:
+            return True
+        await asyncio.sleep(1.0)
+    return False
+
+
+JOB_LIST_SELECTORS = (
+    ".job-card-wrapper",
+    ".job-list-box",
+    ".search-job-result",
+    ".rec-job-list",
+    ".job-list",
+)
+
+
 async def wait_for_page_ready(page: Any, timeout: float = 30.0) -> bool:
-    """等待页面加载完成（兼容 browser-use Page）"""
+    """等待 BOSS 岗位列表区域渲染（避免 SPA 上 networkidle 永不满足）"""
     if page is None:
         return False
 
     if hasattr(page, "wait_for_load_state"):
-        await page.wait_for_load_state("networkidle", timeout=int(timeout * 1000))
-    else:
-        await asyncio.sleep(min(timeout, 5.0))
+        try:
+            await page.wait_for_load_state(
+                "domcontentloaded",
+                timeout=min(int(timeout * 1000), 15000),
+            )
+        except Exception:
+            pass
 
-    await asyncio.sleep(2)
+    if hasattr(page, "wait_for_selector"):
+        for sel in JOB_LIST_SELECTORS:
+            try:
+                await page.wait_for_selector(sel, timeout=4000)
+                await asyncio.sleep(1.5)
+                return True
+            except Exception:
+                continue
+
+    await asyncio.sleep(3)
     return True
 
 
@@ -316,23 +612,49 @@ _EXTRACT_PAGE_TEXT_JS = """
 """
 
 
-async def extract_page_text(page: Any, max_chars: int = 12000) -> str:
+def _is_transient_page_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return any(
+        token in msg
+        for token in ("destroyed", "navigation", "execution context", "target closed")
+    )
+
+
+async def extract_page_text(page: Any, max_chars: int = 12000, retries: int = 3) -> str:
     """从当前页面提取可见文本（不触发 Browser Use 重新导航）"""
     if page is None:
         return ""
 
-    text = ""
-    if hasattr(page, "evaluate"):
-        text = await page.evaluate(_EXTRACT_PAGE_TEXT_JS)
-    elif hasattr(page, "content"):
-        text = await page.content()
+    last_err: Optional[Exception] = None
+    for attempt in range(max(1, retries)):
+        try:
+            text = ""
+            if hasattr(page, "evaluate"):
+                text = await page.evaluate(_EXTRACT_PAGE_TEXT_JS)
+            elif hasattr(page, "content"):
+                text = await page.content()
 
-    if not text:
-        return ""
-    text = str(text).strip()
-    if len(text) > max_chars:
-        return text[:max_chars]
-    return text
+            if not text:
+                return ""
+            text = str(text).strip()
+            if len(text) > max_chars:
+                return text[:max_chars]
+            return text
+        except Exception as e:
+            last_err = e
+            if _is_transient_page_error(e) and attempt < retries - 1:
+                await asyncio.sleep(1.5 * (attempt + 1))
+                if hasattr(page, "wait_for_load_state"):
+                    try:
+                        await page.wait_for_load_state("domcontentloaded", timeout=5000)
+                    except Exception:
+                        pass
+                continue
+            raise
+
+    if last_err:
+        raise last_err
+    return ""
 
 
 def page_needs_login(page_text: str, page_url: str = "") -> bool:
@@ -405,57 +727,133 @@ BOSS_AUTH_COOKIE_NAMES = frozenset({
     "bst",
 })
 
+BOSS_STRONG_AUTH_COOKIES = frozenset({
+    "wt2",
+    "__zp_stoken__",
+    "zp_at",
+    "sid",
+    "geek_zp_token",
+    "bst",
+})
 
-async def check_login_by_cookies(context: Any, page: Any = None) -> bool:
-    """
-    通过 Cookie 和页面 URL 判断 BOSS 直聘是否已登录
 
-    必须同时满足：
-    1. 页面 URL 在 zhipin.com 域名下（不是 about:blank）
-    2. 存在有效的认证 Cookie
-    """
-    if context is None or not hasattr(context, "cookies"):
-        return False
-
-    # 先检查页面 URL
-    if page is not None:
-        try:
-            current_url = ""
-            if hasattr(page, "url"):
-                url_attr = page.url
-                if asyncio.iscoroutine(url_attr):
-                    current_url = await url_attr
-                else:
-                    current_url = str(url_attr)
-
-            # URL 必须是 zhipin.com 且不是登录页
-            if "zhipin.com" not in current_url or "about:blank" in current_url:
-                return False
-            # 在登录页说明还没登录成功
-            if "/web/user" in current_url or "login" in current_url.lower():
-                return False
-        except Exception:
-            pass
-
-    try:
-        cookies = await context.cookies()
-    except Exception:
-        return False
-
-    # 检查是否有有效的认证 Cookie
-    has_auth_cookie = False
+def cookies_indicate_login(cookies: list) -> bool:
+    """根据 zhipin.com 域强认证 Cookie 判断是否已登录"""
     for cookie in cookies:
         domain = cookie.get("domain", "")
         if "zhipin.com" not in domain:
             continue
         name = cookie.get("name", "")
         value = (cookie.get("value") or "").strip()
-        # 必须是真正的会话 Cookie（有值且长度合理）
-        if value and len(value) > 10 and name in BOSS_AUTH_COOKIE_NAMES:
-            has_auth_cookie = True
-            break
+        if not value or value == "-":
+            continue
+        if name not in BOSS_STRONG_AUTH_COOKIES:
+            continue
+        min_len = 10 if name == "wt2" else 8
+        if len(value) >= min_len:
+            return True
+    return False
 
-    return has_auth_cookie
+
+async def check_login_by_cookies(context: Any, page: Any = None) -> bool:
+    """
+    通过 Cookie 判断 BOSS 直聘是否已登录
+
+    以 context 中的认证 Cookie 为主；page 仅作辅助，不再因 about:blank 误判未登录。
+    """
+    if context is None or not hasattr(context, "cookies"):
+        return False
+
+    try:
+        cookies = await context.cookies()
+    except Exception:
+        return False
+
+    if not cookies_indicate_login(cookies):
+        return False
+
+    if context and hasattr(context, "pages"):
+        for p in context.pages:
+            try:
+                if p.is_closed():
+                    continue
+                url = await get_page_url(p)
+                if "zhipin.com" in url and "about:blank" not in url:
+                    return True
+            except Exception:
+                continue
+    return False
+
+
+async def list_live_pages(browser_agent: Any) -> list:
+    """列出浏览器中所有仍存活的标签页（跨 context 扫描，跳过 about:blank）"""
+    pages = []
+    browser = getattr(browser_agent, "_browser", None)
+    contexts = []
+    if browser and hasattr(browser, "contexts"):
+        try:
+            contexts = list(browser.contexts)
+        except Exception:
+            contexts = []
+    ctx = getattr(browser_agent, "_playwright_context", None)
+    if ctx and ctx not in contexts:
+        contexts.append(ctx)
+
+    for context in contexts:
+        if not hasattr(context, "pages"):
+            continue
+        for p in context.pages:
+            try:
+                if p.is_closed():
+                    continue
+                url = await get_page_url(p)
+                if _is_blank_url(url):
+                    continue
+                pages.append(p)
+            except Exception:
+                continue
+    return pages
+
+
+async def refresh_browser_page(
+    browser_agent: Any, login_url: str = "", logger=None
+) -> Optional[Any]:
+    """
+    从浏览器上下文重新获取可用页面（CDP 模式下原 page 引用常会失效）
+    """
+    if browser_agent is None:
+        return None
+
+    pages = await list_live_pages(browser_agent)
+    if logger and not pages:
+        logger.warning("Playwright 未检测到任何存活标签页（Edge 可能已关闭最后一个标签）")
+
+    if pages:
+        context = getattr(browser_agent, "_playwright_context", None)
+        page = None
+        if context:
+            page = await pick_zhipin_page(context, login_url=login_url, focus=False)
+        if page is None:
+            for p in pages:
+                url = await get_page_url(p)
+                if "zhipin.com" in url:
+                    page = p
+                    break
+        page = page or pages[0]
+        browser_agent._page = page
+        url = await get_page_url(page)
+        if logger:
+            logger.info(f"已刷新页面对象 | 标签数: {len(pages)} | URL: {url}")
+        return page
+
+    page = getattr(browser_agent, "_page", None)
+    if page is not None:
+        try:
+            if not page.is_closed():
+                return page
+        except Exception:
+            pass
+    return None
 
 
 async def wait_for_user_login(
@@ -483,6 +881,15 @@ async def wait_for_user_login(
     if grace_period > 0:
         await asyncio.sleep(grace_period)
 
+    page = await refresh_browser_page(browser_agent, login_url, logger)
+    if page is None:
+        logger.error(
+            "未找到可用的 BOSS 直聘页面。"
+            "这通常不是 BOSS 反爬拦截，而是 Edge 最后一个标签被关闭导致浏览器退出。"
+            "请重新点击「启动自动求职」，在自动化 Edge 窗口中完成登录"
+        )
+        return False
+
     elapsed = grace_period
     confirmed = 0
     context = getattr(browser_agent, "_playwright_context", None) if browser_agent else None
@@ -491,26 +898,59 @@ async def wait_for_user_login(
         if not should_continue():
             return False
 
-        # 使用当前页面检查登录状态（必须同时满足 URL 在 zhipin.com 且 Cookie 有效）
-        if context and await check_login_by_cookies(context, page):
+        page = await refresh_browser_page(browser_agent, login_url, logger=None)
+        if page is None:
+            logger.warning("页面对象暂时不可用，继续等待...")
+            await asyncio.sleep(poll_interval)
+            elapsed += poll_interval
+            continue
+
+        current_url = await get_page_url(page)
+        if _is_blank_url(current_url) and login_url and browser_agent:
+            logger.warning(
+                "登录页跳转为空白页（可能被 BOSS 识别为自动化）。"
+                "建议改用手动启动 Edge，正在尝试重新打开登录页..."
+            )
+            ctx = getattr(browser_agent, "_playwright_context", None)
+            if ctx:
+                page = await ensure_zhipin_login_page(ctx, login_url)
+                if page:
+                    browser_agent._page = page
+
+        logged_in = False
+        if context:
+            logged_in, hit_page, hit_url = await scan_pages_for_login(context)
+            if logged_in:
+                if hit_page is not None:
+                    page = hit_page
+                logger.debug(f"页面内容检测到已登录 | URL: {hit_url}")
+            elif await check_login_by_cookies(context, page=None):
+                logged_in = True
+                logger.debug("Cookie 检测到已登录")
+
+        if logged_in:
             confirmed += 1
             logger.info(f"检测到已登录状态 ({confirmed}/{confirm_checks})")
             if confirmed >= confirm_checks:
                 logger.info("登录确认完成，准备进入岗位搜索")
                 if browser_agent:
-                    # 获取当前活动页面
-                    try:
-                        pages = context.pages
-                        for p in pages:
-                            if not p.is_closed():
-                                url = p.url if hasattr(p, "url") else ""
+                    if page is not None:
+                        browser_agent._page = page
+                    elif context:
+                        for p in context.pages:
+                            try:
+                                if p.is_closed():
+                                    continue
+                                url = await get_page_url(p)
                                 if "zhipin.com" in url and "/web/user" not in url:
                                     browser_agent._page = p
                                     break
-                    except Exception:
-                        pass
+                            except Exception:
+                                continue
                     if hasattr(browser_agent, "_async_save_session"):
                         await browser_agent._async_save_session()
+                    if hasattr(browser_agent, "_ensure_keeper_tab"):
+                        await browser_agent._ensure_keeper_tab()
                 return True
         else:
             confirmed = 0

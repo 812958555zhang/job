@@ -51,6 +51,69 @@ class JobScreener:
                 salary_max=100,
                 locations=[""],
             )
+        self._apply_user_profile()
+
+    def _apply_user_profile(self) -> None:
+        """用上传简历中的求职意向覆盖/补充配置，实现简历驱动匹配"""
+        profile = self._user_profile
+
+        if profile.expected_positions:
+            self._criteria.job_keywords = list(
+                dict.fromkeys(profile.expected_positions + self._criteria.job_keywords)
+            )
+        elif profile.current_position:
+            self._criteria.job_keywords = list(
+                dict.fromkeys([profile.current_position] + self._criteria.job_keywords)
+            )
+
+        if profile.skills:
+            top_skills = [s for s in profile.skills[:6] if s]
+            self._criteria.job_keywords = list(
+                dict.fromkeys(self._criteria.job_keywords + top_skills)
+            )
+
+        if profile.expected_locations:
+            self._criteria.locations = list(
+                dict.fromkeys(profile.expected_locations + self._criteria.locations)
+            )
+
+        if profile.expected_salary_min is not None:
+            self._criteria.salary_min = profile.expected_salary_min
+        if profile.expected_salary_max is not None:
+            self._criteria.salary_max = profile.expected_salary_max
+
+        if profile.education:
+            self._criteria.education = profile.education
+
+        if profile.total_experience_years:
+            self._criteria.experience_min_years = min(
+                self._criteria.experience_min_years or 0,
+                profile.total_experience_years,
+            )
+
+        self._logger.info(
+            "简历驱动筛选标准 | 关键词: %s | 城市: %s | 薪资: %s-%sK | 学历: %s",
+            ", ".join(k for k in self._criteria.job_keywords if k),
+            ", ".join(c for c in self._criteria.locations if c) or "不限",
+            self._criteria.salary_min,
+            self._criteria.salary_max,
+            self._criteria.education or "不限",
+        )
+
+    def add_search_city(self, city: str) -> None:
+        """将 BOSS 搜索页当前城市加入匹配范围（如页面显示「广州[切换]」）"""
+        city = (city or "").strip()
+        if not city:
+            return
+        if city not in self._criteria.locations:
+            self._criteria.locations.insert(0, city)
+            self._logger.info("已根据搜索页自动加入工作城市: %s", city)
+
+    def get_active_keywords(self) -> list:
+        return [k for k in self._criteria.job_keywords if k]
+
+    def get_active_locations(self) -> list:
+        return [c for c in self._criteria.locations if c]
 
     def _load_criteria_from_config(self) -> JobCriteria:
         """

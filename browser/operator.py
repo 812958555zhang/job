@@ -14,7 +14,15 @@ import random
 import time
 from typing import Optional
 
-from browser.agent_helpers import run_browser_use_task, navigate_page, go_back_page, scroll_page
+from browser.agent_helpers import (
+    run_browser_use_task,
+    navigate_page,
+    go_back_page,
+    scroll_page,
+    scroll_to_load_lazy_content,
+    click_next_page_playwright,
+    refresh_browser_page,
+)
 from utils.logger import get_logger
 
 
@@ -250,6 +258,36 @@ class BrowserOperator:
             self._logger.error(f"页面滚动失败: {e}", exc_info=True)
             return False
 
+    async def scroll_to_load_jobs(self, steps: int = 6) -> bool:
+        """
+        分步滚动岗位列表以触发懒加载，完成后滚回顶部
+
+        Args:
+            steps: 滚动步数
+
+        Returns:
+            bool: 操作成功返回True，失败返回False
+        """
+        self._logger.info("滚动加载岗位列表（触发懒加载）")
+
+        try:
+            page = self._browser_agent.get_page()
+            if not page:
+                self._logger.error("页面不可用")
+                return False
+
+            ok = await scroll_to_load_lazy_content(page, steps=steps)
+            if ok:
+                from browser.agent_helpers import count_job_cards
+
+                cards = await count_job_cards(page)
+                self._logger.info("岗位列表滚动加载完成 | 可见岗位卡片: %s", cards)
+            return ok
+
+        except Exception as e:
+            self._logger.error(f"滚动加载岗位列表失败: {e}", exc_info=True)
+            return False
+
     async def scroll_to_bottom(self) -> bool:
         """
         滚动到页面底部
@@ -277,34 +315,26 @@ class BrowserOperator:
 
     async def click_next_page(self) -> bool:
         """
-        点击下一页按钮
+        翻到下一页（Playwright 直接操作，不用 browser-use AI）
 
         Returns:
             bool: 操作成功返回True，失败返回False
         """
-        self._logger.info("点击下一页")
+        self._logger.info("自动翻页（Playwright）")
 
         try:
-            agent = await self._get_browser_use_agent()
-            if not agent:
-                self._logger.error("Browser Use Agent 未初始化")
+            page = self._browser_agent.get_page()
+            page = await refresh_browser_page(self._browser_agent) or page
+            if not page:
+                self._logger.error("页面不可用")
                 return False
 
-            # 随机延迟
-            await self._random_delay()
-
-            # 使用Browser Use执行翻页操作
-            result = await run_browser_use_task(
-                agent,
-                "点击页面底部的'下一页'按钮或翻页按钮",
-            )
-
-            if result and hasattr(result, 'content'):
-                self._logger.info("翻页操作成功")
+            if await click_next_page_playwright(page):
+                self._logger.info("翻页成功")
                 return True
 
-            self._logger.warning("翻页操作返回结果为空")
-            return False
+            self._logger.warning("未找到下一页按钮，尝试滚动加载")
+            return await self.scroll_down()
 
         except Exception as e:
             self._logger.error(f"翻页失败: {e}", exc_info=True)

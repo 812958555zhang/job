@@ -10,7 +10,13 @@ from typing import Callable, Optional
 from urllib.parse import quote
 
 from browser.agent import BrowserAgent
-from browser.agent_helpers import wait_for_user_login
+from browser.agent_helpers import extract_page_text, wait_for_user_login
+from browser.boss_city import (
+    cities_match,
+    detect_city_from_page_text,
+    ensure_boss_search_city,
+    resolve_city_code,
+)
 from browser.job_scanner import JobScanner
 from browser.operator import BrowserOperator
 from core.chat_generator import ChatGenerator
@@ -27,12 +33,87 @@ BOSS_JOB_SEARCH_URL = "https://www.zhipin.com/web/geek/jobs"
 LOGIN_WAIT_SECONDS = 180
 
 
-def build_job_search_url() -> str:
-    """根据 settings.yaml 中的岗位关键词构建 BOSS 直聘搜索页 URL"""
+def _pick_search_keyword(user_profile: UserProfile) -> str:
+    """优先用简历中的期望岗位/当前职位，其次用配置关键词"""
+    if user_profile.expected_positions:
+        return str(user_profile.expected_positions[0])
+    if user_profile.current_position:
+        return str(user_profile.current_position)
     settings = load_settings()
-    keywords = settings.get("job_keywords") or []
-    query = keywords[0] if keywords else "Python"
-    return f"{BOSS_JOB_SEARCH_URL}?query={quote(str(query))}"
+    config_keywords = settings.get("job_keywords") or []
+    if config_keywords:
+        return str(config_keywords[0])
+    if user_profile.skills:
+        return str(user_profile.skills[0])
+    return "Python"
+
+
+def _pick_search_city(user_profile: UserProfile) -> Optional[str]:
+    """优先用简历期望城市，其次用配置中的期望城市"""
+    for city in user_profile.expected_locations or []:
+        city = str(city).strip()
+        if city:
+            return city
+
+    settings = load_settings()
+    for city in settings.get("locations") or []:
+        city = str(city).strip()
+        if city:
+            return city
+    return None
+
+
+def build_job_search_url(
+    user_profile: Optional[UserProfile] = None,
+    page: int = 1,
+    city_code: Optional[str] = None,
+) -> str:
+    """根据简历/配置构建 BOSS 直聘搜索页 URL（支持城市与自动翻页）"""
+    query = _pick_search_keyword(user_profile) if user_profile else "Python"
+    url = f"{BOSS_JOB_SEARCH_URL}?query={quote(query)}"
+    if city_code:
+        url += f"&city={city_code}"
+    if page > 1:
+        url += f"&page={page}"
+    return url
+
+
+def detect_city_from_text(text: str) -> Optional[str]:
+    """从 BOSS 搜索页文本识别当前城市（兼容旧调用）"""
+    return detect_city_from_page_text(text)
+
+
+async def _prepare_search_page(
+    browser_agent,
+    scanner: JobScanner,
+    operator: BrowserOperator,
+    target_city_name: Optional[str],
+    city_code: Optional[str],
+) -> None:
+    """搜索页加载后：切换城市 → 等待岗位卡片 → 鼠标滚轮懒加载"""
+    from browser.agent_helpers import count_job_cards, wait_for_job_cards
+
+    await scanner.wait_for_dynamic_content(timeout=30)
+
+    page = browser_agent.get_page()
+    if page and target_city_name:
+        switched = await ensure_boss_search_city(page, target_city_name, city_code)
+        if switched:
+            await scanner.wait_for_dynamic_content(timeout=15)
+        page = browser_agent.get_page()
+
+    if page:
+        if not await wait_for_job_cards(page, min_count=3, timeout=25):
+            _logger.warning("岗位卡片尚未出现，将尝试滚轮加载...")
+        await operator.scroll_to_load_jobs()
+        cards = await count_job_cards(page)
+        _logger.info("页面就绪 | 可见岗位卡片: %s", cards)
+        if cards < 3:
+            await operator.scroll_to_load_jobs(steps=8)
+            cards = await count_job_cards(page)
+            _logger.info("二次滚轮加载后 | 可见岗位卡片: %s", cards)
+
+    await asyncio.sleep(1)
 
 
 async def _apply_to_job(
@@ -69,8 +150,12 @@ def _save_application(
     greeting: Optional[str],
     status: str,
 ) -> None:
-    """将求职记录写入 SQLite"""
+    """将求职记录写入 SQLite（已存在则跳过，避免重复告警）"""
     db = get_db()
+    if db.check_job_applied(job.job_id):
+        _logger.debug("求职记录已存在，跳过写入 job_id=%s", job.job_id)
+        return
+
     try:
         db.create_application(
             {
@@ -135,6 +220,14 @@ async def run_automation_loop(
     screener._criteria.match_score_threshold = match_threshold
     generator = ChatGenerator(user_profile)
 
+    _logger.info(
+        "根据简历自动匹配 | 姓名: %s | 当前职位: %s | 经验: %s年 | 核心技能: %s",
+        user_profile.name,
+        user_profile.current_position or "未填写",
+        user_profile.total_experience_years,
+        ", ".join(user_profile.skills[:6]) if user_profile.skills else "未填写",
+    )
+
     page = browser_agent.get_page()
     if page and not await wait_for_user_login(
         page,
@@ -148,15 +241,58 @@ async def run_automation_loop(
         _logger.error("未完成登录，自动化任务终止")
         return stats
 
-    search_url = build_job_search_url()
+    page_index = 1
+    max_pages = 10
+    target_city_name = _pick_search_city(user_profile)
+    city_code: Optional[str] = None
+
+    live_page = browser_agent.get_page()
+    if target_city_name and live_page:
+        city_code = await resolve_city_code(live_page, target_city_name)
+        if city_code:
+            _logger.info(
+                "按简历切换搜索城市: %s (city=%s)",
+                target_city_name,
+                city_code,
+            )
+            screener.add_search_city(target_city_name)
+        else:
+            _logger.warning(
+                "未找到城市 '%s' 的 BOSS 编码，将使用浏览器当前定位城市",
+                target_city_name,
+            )
+
+    search_url = build_job_search_url(
+        user_profile,
+        page=page_index,
+        city_code=city_code,
+    )
     _logger.info(f"登录成功，导航至岗位搜索页: {search_url}")
 
     if not await operator.navigate_to_url(search_url):
         _logger.error("无法打开岗位搜索页，请检查网络或登录状态")
         return stats
 
-    await scanner.wait_for_dynamic_content(timeout=30)
-    await asyncio.sleep(2)
+    await _prepare_search_page(
+        browser_agent,
+        scanner,
+        operator,
+        target_city_name,
+        city_code,
+    )
+
+    live_page = browser_agent.get_page()
+    if live_page:
+        city_text = await extract_page_text(live_page, max_chars=800)
+        detected_city = detect_city_from_text(city_text)
+        if detected_city:
+            screener.add_search_city(detected_city)
+            if target_city_name and not cities_match(detected_city, target_city_name):
+                _logger.warning(
+                    "搜索页当前城市为 %s，与简历期望 %s 不一致，岗位结果可能不准确",
+                    detected_city,
+                    target_city_name,
+                )
 
     sent_count = 0
     empty_scan_rounds = 0
@@ -179,11 +315,13 @@ async def run_automation_loop(
             if empty_scan_rounds >= max_empty_rounds:
                 _logger.error("连续多次扫描无结果，任务终止")
                 break
-            await operator.scroll_down()
+            await operator.scroll_to_load_jobs(steps=8)
             await asyncio.sleep(2)
             continue
 
         empty_scan_rounds = 0
+        page_matched = 0
+        page_skipped = 0
 
         for job in jobs:
             await _wait_if_paused(should_continue, is_paused)
@@ -195,8 +333,10 @@ async def run_automation_loop(
 
             if not result.get("passed"):
                 stats["skipped_count"] += 1
+                page_skipped += 1
                 _logger.info(
-                    f"跳过岗位: {job.job_name} | 原因: {result.get('reason', '未达标')}"
+                    f"跳过岗位: {job.job_name} | 分数: {result.get('score', 0):.1f} | "
+                    f"原因: {result.get('reason', '未达标')}"
                 )
                 _save_application(
                     job,
@@ -211,7 +351,11 @@ async def run_automation_loop(
 
             score = result.get("score", 0.0)
             reason = result.get("reason", "")
-            _logger.info(f"匹配岗位: {job.job_name} | 分数: {score:.1f}")
+            page_matched += 1
+            _logger.info(
+                f"✅ 简历匹配岗位: {job.job_name} @ {job.company_name or '未知公司'} | "
+                f"分数: {score:.1f} | {reason}"
+            )
 
             try:
                 greeting = generator.generate_greeting(job)
@@ -238,13 +382,35 @@ async def run_automation_loop(
 
             await asyncio.sleep(2)
 
+        _logger.info(
+            f"第 {page_index} 页筛选完成 | 匹配: {page_matched} | 跳过: {page_skipped} | "
+            f"已沟通: {sent_count}/{remaining}"
+        )
+
         if sent_count >= remaining:
             break
 
-        has_next = await operator.click_next_page()
-        if not has_next:
-            await operator.scroll_down()
-        await asyncio.sleep(2)
+        page_index += 1
+        if page_index > max_pages:
+            _logger.info("已达最大自动翻页数 %s，结束扫描", max_pages)
+            break
+
+        next_url = build_job_search_url(
+            user_profile,
+            page=page_index,
+            city_code=city_code,
+        )
+        _logger.info(f"自动翻页 → 第 {page_index} 页: {next_url}")
+        if not await operator.navigate_to_url(next_url):
+            _logger.warning("自动翻页失败，停止继续扫描")
+            break
+        await _prepare_search_page(
+            browser_agent,
+            scanner,
+            operator,
+            target_city_name,
+            city_code,
+        )
 
     _logger.info(
         f"自动化流程结束 | 扫描: {stats['total_count']} | "

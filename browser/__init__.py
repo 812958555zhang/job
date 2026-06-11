@@ -1,7 +1,7 @@
 """
 Browser 自动化模块
 
-提供基于 Browser Use + Playwright + Chromium 的浏览器控制能力，
+提供基于 Browser Use + Playwright + Microsoft Edge（CDP）的浏览器控制能力，
 包括 Agent 管理、会话管理、多标签页操作等功能。
 
 主要组件：

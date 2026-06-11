@@ -5,7 +5,7 @@ Browser Use Agent 核心封装模块
 页面导航、资源释放等功能，为 BOSS 直聘求职自动化提供统一的浏览器控制接口。
 
 功能特性：
-- 基于 Browser Use + Playwright + Chromium 的浏览器自动化
+- 基于 Browser Use + Playwright + Microsoft Edge（CDP）的浏览器自动化
 - 集成火山引擎豆包 LLM（兼容 OpenAI 协议）
 - 反检测模式（undetectable）防止被目标网站识别
 - 完善的异常处理和日志记录
@@ -47,7 +47,7 @@ from utils.logger import get_logger
 
 
 class BrowserCrashError(Exception):
-    """浏览器崩溃异常 - Chromium 进程意外终止或无响应"""
+    """浏览器崩溃异常 - Edge 进程意外终止或无响应"""
 
     def __init__(self, message: str = "浏览器进程崩溃", original_error: Optional[Exception] = None):
         """
@@ -276,6 +276,8 @@ class BrowserAgent:
         self._browser_session = None
         self._page: Optional[Any] = None  # browser-use Page 或 Playwright Page
         self._browser_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._edge_process: Optional[Any] = None
+        self._edge_launched_by_us: bool = False
 
         # 新增：异常处理和状态监控相关属性
         self._retry_count: int = 0  # 当前已重试次数
@@ -440,6 +442,14 @@ class BrowserAgent:
             self._logger.warning("BrowserAgent 已在运行中，无需重复启动")
             return True
 
+        if await self._try_reuse_browser():
+            self._running = True
+            self._start_time = time.time()
+            self._logger.info("✅ 复用已有 Edge 浏览器窗口")
+            return True
+
+        await self._close_browser_resources()
+
         try:
             self._logger.info("🚀 正在启动浏览器...")
 
@@ -489,8 +499,40 @@ class BrowserAgent:
 
         return asyncio.run(self.async_start())
 
-    async def _cleanup_failed_start(self) -> None:
-        """启动失败时释放半初始化的浏览器资源"""
+    def _reset_stale_browser_state(self) -> None:
+        """清理任务状态（不关闭 Edge）"""
+        self._agent = None
+        self._browser_session = None
+        self._page = None
+        self._running = False
+
+    async def _try_reuse_browser(self) -> bool:
+        """复用上次任务留下的 Edge 窗口，避免重复 launch 同一 profile"""
+        ctx = self._playwright_context
+        if not ctx or not self._playwright:
+            return False
+        try:
+            live = [p for p in ctx.pages if not p.is_closed()]
+            if not live:
+                return False
+            self._browser_loop = asyncio.get_running_loop()
+            self._context = ctx
+            if not self._browser:
+                self._browser = getattr(ctx, "browser", None)
+            from browser.agent_helpers import ensure_zhipin_login_page
+
+            self._page = await ensure_zhipin_login_page(ctx, self.BOSS_LOGIN_URL)
+            if not self._page:
+                return False
+            url = await get_page_url(self._page)
+            self._logger.info(f"复用 Edge | 标签数: {len(live)} | URL: {url}")
+            return True
+        except Exception as exc:
+            self._logger.warning(f"复用 Edge 失败，将重新启动: {exc}")
+            return False
+
+    async def _close_browser_resources(self) -> None:
+        """关闭 Playwright 与 Edge 资源（仅在需要全新启动时调用）"""
         if self._agent:
             try:
                 await self._agent.close()
@@ -502,154 +544,114 @@ class BrowserAgent:
                 await self._playwright_context.close()
             except Exception:
                 pass
-            self._playwright_context = None
         if self._browser:
             try:
                 await self._browser.close()
             except Exception:
                 pass
-            self._browser = None
         if self._playwright:
             try:
                 await self._playwright.stop()
             except Exception:
                 pass
-            self._playwright = None
-        self._browser_session = None
+        self._playwright_context = None
+        self._browser = None
+        self._playwright = None
         self._context = None
         self._page = None
+        self._browser_session = None
         self._cdp_port = None
+        self._edge_process = None
+        self._edge_launched_by_us = False
+        self._running = False
+
+    async def _cleanup_failed_start(self) -> None:
+        """启动失败时释放半初始化的浏览器资源"""
+        await self._close_browser_resources()
 
     async def _async_start_browser(self) -> None:
         """
-        使用 Playwright 普通模式启动浏览器（无持久化 profile 目录）
+        连接浏览器（仅手动启动的 Microsoft Edge + CDP）
 
-        登录态通过 data/browser_cookies.json 恢复，避免 browser_profile 膨胀
-        及 Chromium 会话恢复导致的多标签 / 页面被切走。
+        不会自动拉起 Edge，须用户先按提示命令启动 Edge。
         """
         from playwright.async_api import async_playwright
+        from browser.agent_edge import EDGE_DEBUG_PORT, EDGE_MANUAL_START_HINT, get_or_launch_edge
+        from browser.agent_helpers import ensure_zhipin_login_page
 
         self._browser_loop = asyncio.get_running_loop()
-        browser_cfg = self._config.get("browser_config", {})
-        headless = browser_cfg.get("headless", self.DEFAULT_HEADLESS)
-        width = browser_cfg.get("window_width", self.DEFAULT_WINDOW_WIDTH)
-        height = browser_cfg.get("window_height", self.DEFAULT_WINDOW_HEIGHT)
-
-        self._cdp_port = _allocate_free_port()
-        cdp_url = f"http://127.0.0.1:{self._cdp_port}"
-
         self._playwright = await async_playwright().start()
+        self._cdp_port = EDGE_DEBUG_PORT
+        cdp_url = f"http://127.0.0.1:{EDGE_DEBUG_PORT}"
 
-        # 增强反检测启动参数
-        launch_args = [
-            f"--remote-debugging-port={self._cdp_port}",
-            "--disable-blink-features=AutomationControlled",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--disable-web-security",
-            "--disable-features=IsolateOrigins,site-per-process",
-            "--disable-site-isolation-trials",
-            "--disable-bundled-ppapi-flash",
-            "--disable-plugins-discovery",
-            "--disable-background-networking",
-            "--disable-background-timer-throttling",
-            "--disable-backgrounding-occluded-windows",
-            "--disable-breakpad",
-            "--disable-component-extensions-with-background-pages",
-            "--disable-default-apps",
-            "--disable-dev-shm-usage",
-            "--disable-extensions",
-            "--disable-features=TranslateUI",
-            "--disable-hang-monitor",
-            "--disable-ipc-flooding-protection",
-            "--disable-popup-blocking",
-            "--disable-prompt-on-repost",
-            "--disable-renderer-backgrounding",
-            "--disable-sync",
-            "--force-color-profile=srgb",
-            "--metrics-recording-only",
-            "--safebrowsing-disable-auto-update",
-            "--enable-automation",
-            "--password-store=basic",
-            "--use-mock-keychain",
-            "--lang=zh-CN",
-            "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-        ]
-
-        if not headless:
-            launch_args.extend([
-                "--start-maximized",
-                "--window-position=0,0",
-            ])
-
-        self._browser = await self._playwright.chromium.launch(
-            headless=headless,
-            args=launch_args,
+        self._logger.info("正在连接手动启动的 Microsoft Edge（CDP）...")
+        self._browser, self._playwright_context, edge_proc = await get_or_launch_edge(
+            self._playwright, port=EDGE_DEBUG_PORT
         )
 
-        # 创建带有反检测特征的上下文
-        self._playwright_context = await self._browser.new_context(
-            viewport={"width": width, "height": height},
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-            locale="zh-CN",
-            timezone_id="Asia/Shanghai",
-            permissions=["geolocation"],
-            java_script_enabled=True,
-            bypass_csp=True,
-        )
+        if not self._playwright_context:
+            try:
+                await self._playwright.stop()
+            except Exception:
+                pass
+            self._playwright = None
+            raise BrowserCrashError(
+                "无法连接 Microsoft Edge。请先手动启动 Edge 后再试。"
+                f"{EDGE_MANUAL_START_HINT}"
+            )
 
-        # 注入反检测脚本，隐藏 webdriver 标志
-        await self._playwright_context.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', {
-                get: () => undefined
-            });
-            Object.defineProperty(navigator, 'plugins', {
-                get: () => [1, 2, 3, 4, 5]
-            });
-            Object.defineProperty(navigator, 'languages', {
-                get: () => ['zh-CN', 'zh', 'en']
-            });
-            window.chrome = { runtime: {} };
-        """)
+        if not self._browser and self._playwright_context:
+            self._browser = getattr(self._playwright_context, "browser", None)
+
+        self._edge_process = edge_proc
+        self._edge_launched_by_us = False
         self._context = self._playwright_context
+        self._logger.info("已连接 Microsoft Edge | CDP: %s（手动启动）", cdp_url)
 
-        # 暂时不加载旧 Cookie，避免 BOSS 直聘检测到异常会话
-        # 用户需要重新手动登录，这样更稳定
         saved_cookies = self._session_manager.load_cookies()
         if saved_cookies:
-            self._logger.info(f"已保存的 Cookie 暂不加载（共 {len(saved_cookies)} 条），建议重新登录以确保会话干净")
-
-        await _wait_for_cdp_http_ready(cdp_url)
-        self._logger.info(f"Playwright 浏览器已启动 | CDP: {cdp_url}")
-
-        # 创建新页面并导航到登录页
-        self._page = await self._playwright_context.new_page()
-
-        # 导航到登录页 - 使用 Playwright 原生方法确保可靠
-        try:
-            await self._page.goto(
-                self.BOSS_LOGIN_URL,
-                wait_until="domcontentloaded",
-                timeout=30000
+            self._logger.info(
+                f"检测到本地 Cookie 备份（{len(saved_cookies)} 条），"
+                "登录态以 Edge 浏览器内会话为准，启动时不注入以免干扰扫码"
             )
-            await asyncio.sleep(2.0)
-            final_url = self._page.url
 
-            # 如果仍然是 about:blank，尝试再次导航
-            if "about:blank" in final_url:
-                await self._page.goto(self.BOSS_LOGIN_URL, timeout=30000)
-                await asyncio.sleep(2.0)
-                final_url = self._page.url
+        self._page = await ensure_zhipin_login_page(
+            self._playwright_context, self.BOSS_LOGIN_URL
+        )
+        if not self._page:
+            raise BrowserCrashError(
+                "无法获取 Edge 页面标签。"
+                "请关闭多余 Edge 窗口后重试，或手动启动 Edge："
+                f"{EDGE_MANUAL_START_HINT}"
+            )
 
-            if "zhipin.com" in final_url:
-                self._logger.info(f"已打开 BOSS 直聘登录页 | URL: {final_url}")
-            else:
+        try:
+            final_url = await get_page_url(self._page)
+            self._logger.info(f"BOSS 直聘页面就绪 | URL: {final_url}")
+            if "zhipin.com" not in final_url or "about:blank" in final_url:
                 self._logger.warning(
-                    f"登录页导航异常 | 当前 URL: {final_url}"
+                    f"登录页可能未正确加载，请手动访问: {self.BOSS_LOGIN_URL}"
                 )
         except Exception as e:
-            self._logger.error(f"导航到登录页失败: {e}")
-            final_url = await get_page_url(self._page) if self._page else ""
+            self._logger.warning(
+                f"读取页面 URL 失败，请手动访问: {self.BOSS_LOGIN_URL} | 错误: {e}"
+            )
+
+    async def _ensure_keeper_tab(self) -> None:
+        """先打开空白备用标签，防止 BOSS 页关闭后 Edge 整个退出"""
+        if not self._playwright_context:
+            return
+        try:
+            live = [p for p in self._playwright_context.pages if not p.is_closed()]
+            if len(live) >= 2:
+                self._logger.info("已有多个标签页，跳过备用标签")
+                return
+            keeper = await self._playwright_context.new_page()
+            await keeper.goto("about:blank", wait_until="commit", timeout=15000)
+            self._keeper_page = keeper
+            self._logger.info("已打开备用空白标签（防止 Edge 自动退出）")
+        except Exception as exc:
+            self._logger.warning(f"备用标签创建失败: {exc}")
 
     async def ensure_browser_use_agent(self) -> Agent:
         """
@@ -759,10 +761,6 @@ class BrowserAgent:
                 self._agent = None
 
             if self._playwright_context:
-                try:
-                    await self._playwright_context.close()
-                except Exception:
-                    pass
                 self._playwright_context = None
 
             if self._browser:
@@ -778,6 +776,11 @@ class BrowserAgent:
                 except Exception:
                     pass
                 self._playwright = None
+
+            # 仅断开 Playwright，不关闭用户 Edge 窗口（便于继续登录或手动操作）
+            if hasattr(self, '_edge_process') and self._edge_process:
+                self._edge_process = None
+            self._edge_launched_by_us = False
 
             self._browser = None
             self._context = None
@@ -817,23 +820,27 @@ class BrowserAgent:
 
     async def _async_save_session(self) -> None:
         """保存 Playwright 浏览器 Cookie 到本地"""
-        if self._playwright_context:
-            try:
-                cookies = await self._playwright_context.cookies()
-                with open(
-                    self._session_manager._cookie_path, "w", encoding="utf-8"
-                ) as f:
-                    json.dump(cookies, f, ensure_ascii=False, indent=2)
-                self._logger.info(
-                    f"Cookie 已保存至 {self._session_manager._cookie_path}"
-                    f"（共 {len(cookies)} 条）"
-                )
-            except Exception as exc:
-                self._logger.warning(f"保存 Cookie 失败: {exc}")
-        elif self._context:
-            self._session_manager.save_cookies(self._context)
-        else:
+        ctx = self._playwright_context or self._context
+        if not ctx:
             self._logger.debug("无可用的浏览器上下文，跳过会话保存")
+            return
+
+        try:
+            if self._browser and hasattr(self._browser, "is_connected"):
+                if not self._browser.is_connected():
+                    self._logger.debug("浏览器已断开，跳过 Cookie 保存")
+                    return
+            cookies = await ctx.cookies()
+            with open(
+                self._session_manager._cookie_path, "w", encoding="utf-8"
+            ) as f:
+                json.dump(cookies, f, ensure_ascii=False, indent=2)
+            self._logger.info(
+                f"Cookie 已保存至 {self._session_manager._cookie_path}"
+                f"（共 {len(cookies)} 条）"
+            )
+        except Exception as exc:
+            self._logger.warning(f"保存 Cookie 失败: {exc}")
 
     def _save_session(self) -> None:
         """
@@ -1153,7 +1160,7 @@ class BrowserAgent:
 
     def _check_browser_process_alive(self) -> bool:
         """
-        检查 Chromium 进程是否存活（内部方法）
+        检查 Edge / 浏览器进程是否存活（内部方法）
 
         通过操作系统进程列表检查浏览器进程是否存在，
         用于心跳检测和健康检查。
@@ -1182,30 +1189,37 @@ class BrowserAgent:
             finally:
                 loop.close()
 
-            # 方式2：通过操作系统进程检查 chromium 是否存在
+            # 方式2：通过操作系统进程检查 Edge / Chrome 是否存在
             import subprocess
 
-            # Windows 系统使用 tasklist 命令
             if os.name == 'nt':
-                result = subprocess.run(
+                edge_result = subprocess.run(
+                    ['tasklist', '/FI', 'IMAGENAME eq msedge.exe'],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                if 'msedge.exe' in edge_result.stdout:
+                    return True
+                chrome_result = subprocess.run(
                     ['tasklist', '/FI', 'IMAGENAME eq chrome.exe'],
                     capture_output=True,
                     text=True,
-                    timeout=5
+                    timeout=5,
                 )
-                if 'chrome.exe' not in result.stdout:
-                    self._logger.warning("⚠️ 未找到 Chrome/Chromium 进程")
+                if 'chrome.exe' not in chrome_result.stdout:
+                    self._logger.warning("⚠️ 未找到 Edge/Chrome 浏览器进程")
                     return False
             else:
                 # Linux/Mac 使用 pgrep 命令
                 result = subprocess.run(
-                    ['pgrep', '-f', 'chromium'],
+                    ['pgrep', '-f', 'msedge|chromium|chrome'],
                     capture_output=True,
                     text=True,
-                    timeout=5
+                    timeout=5,
                 )
                 if result.returncode != 0:
-                    self._logger.warning("⚠️ 未找到 Chromium 进程")
+                    self._logger.warning("⚠️ 未找到 Edge/Chrome 浏览器进程")
                     return False
 
             return True
