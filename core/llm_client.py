@@ -979,6 +979,88 @@ class VolcengineLLMClient:
                 original_error=e,
             ) from e
 
+    async def avision_chat(
+        self,
+        image_base64: str,
+        message: str,
+        system_prompt: Optional[str] = None,
+        model: Optional[str] = None,
+        temperature: float = DEFAULT_TEMPERATURE,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
+        image_mime: str = "image/png",
+    ) -> dict:
+        """发送带图片的多模态聊天请求（异步）"""
+        actual_model = model or self.vision_model
+        messages: list[dict] = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append(
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:{image_mime};base64,{image_base64}",
+                        },
+                    },
+                    {"type": "text", "text": message},
+                ],
+            }
+        )
+
+        start_time = self._log_request_start(actual_model, message[:80], len(messages))
+        try:
+            response = await self.async_client.chat.completions.create(
+                model=actual_model,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            result = self._parse_response(response)
+            self._log_request_end(start_time, result["usage"], success=True)
+            return result
+        except Exception as e:
+            self._log_request_end(start_time, {}, False, str(e))
+            self._logger.error("Vision LLM 调用失败: %s", e, exc_info=True)
+            raise LLMAPIError(
+                message=f"Vision LLM API 调用异常: {e}",
+                original_error=e,
+            ) from e
+
+    async def avision_chat_json(
+        self,
+        image_base64: str,
+        message: str,
+        system_prompt: Optional[str] = None,
+        model: Optional[str] = None,
+        temperature: float = DEFAULT_TEMPERATURE,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
+    ) -> dict:
+        """Vision 多模态请求，返回 JSON 结构化内容"""
+        json_system_prompt = (
+            (system_prompt or "")
+            + "\n\n请严格以 JSON 格式返回结果，不要包含任何其他文本说明。"
+        ).strip()
+
+        raw_result = await self.avision_chat(
+            image_base64=image_base64,
+            message=message,
+            system_prompt=json_system_prompt,
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+
+        try:
+            parsed_content = _parse_model_json(raw_result["content"], self._logger)
+            return {**raw_result, "content": parsed_content}
+        except json.JSONDecodeError as e:
+            raise LLMAPIError(
+                message="Vision 模型返回的内容不是有效的 JSON 格式",
+                original_error=e,
+            ) from e
+
     async def achat_stream(
         self,
         message: str,

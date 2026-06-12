@@ -18,7 +18,9 @@ from browser.agent_edge import (
     check_edge_cdp_sync,
 )
 from core.automation_engine import run_automation_loop
+from core.vision_agent import run_vision_automation_loop
 from core.profile_manager import get_profile_manager
+from utils.config_loader import load_settings
 from utils.logger import get_logger
 from utils.delay_simulator import get_simulator
 from utils.db_helper import get_db
@@ -56,7 +58,8 @@ def on_start_click(
     daily_limit: int,
     match_threshold: float,
     delay_min: float,
-    delay_max: float
+    delay_max: float,
+    automation_mode: str,
 ) -> Tuple[str, str, str, str]:
     """
     点击"启动自动求职"按钮的回调函数
@@ -93,7 +96,11 @@ def on_start_click(
             "enabled", "disabled", "disabled",
         )
 
-    if not check_edge_cdp_sync():
+    mode = (automation_mode or "browser").strip().lower()
+    if mode not in ("browser", "vision"):
+        mode = "browser"
+
+    if mode == "browser" and not check_edge_cdp_sync():
         _logger.warning("启动前未检测到 Edge CDP: %s", EDGE_MANUAL_START_HINT)
         return (
             f"❌ 未检测到 Edge（端口 {EDGE_DEBUG_PORT}）。"
@@ -102,6 +109,9 @@ def on_start_click(
             "disabled",
             "disabled",
         )
+
+    if mode == "vision":
+        _logger.info("视觉模式：请手动打开 BOSS 直聘搜索页并置于前台")
 
     try:
         _is_running = True
@@ -113,10 +123,18 @@ def on_start_click(
         simulator = get_simulator()
         simulator.set_delay_range(delay_min, delay_max)
 
-        if _browser_agent is None:
-            _browser_agent = BrowserAgent()
-        start_automation_task(daily_limit, match_threshold, profile)
-        return "▶️ 自动化任务已启动（连接 Edge 中）", "disabled", "enabled", "enabled"
+        if mode == "browser":
+            if _browser_agent is None:
+                _browser_agent = BrowserAgent()
+            start_automation_task(
+                daily_limit, match_threshold, profile, automation_mode=mode
+            )
+            return "▶️ 自动化任务已启动（连接 Edge 中）", "disabled", "enabled", "enabled"
+
+        start_automation_task(
+            daily_limit, match_threshold, profile, automation_mode=mode
+        )
+        return "▶️ 视觉模式已启动（请将 BOSS 窗口置于前台）", "disabled", "enabled", "enabled"
 
     except Exception as e:
         _is_running = False
@@ -189,7 +207,12 @@ def on_stop_click() -> Tuple[str, str, str, str]:
         return f"❌ 停止失败: {str(e)}", "enabled", "disabled", "disabled"
 
 
-def start_automation_task(daily_limit: int, match_threshold: float, user_profile):
+def start_automation_task(
+    daily_limit: int,
+    match_threshold: float,
+    user_profile,
+    automation_mode: str = "browser",
+):
     """
     启动自动化任务线程
 
@@ -208,6 +231,19 @@ def start_automation_task(daily_limit: int, match_threshold: float, user_profile
         global _is_running, _today_stats, _ui_status
 
         async def _run_all():
+            mode = (automation_mode or "browser").strip().lower()
+            if mode == "vision":
+                _ui_status = "▶️ 视觉模式运行中"
+                _logger.info("✅ 视觉驱动模式启动（无需 Edge CDP）")
+                return await run_vision_automation_loop(
+                    user_profile=user_profile,
+                    daily_limit=daily_limit,
+                    match_threshold=match_threshold,
+                    should_continue=lambda: _is_running,
+                    is_paused=lambda: _is_paused,
+                    on_stats_update=_on_stats_update,
+                )
+
             if not _browser_agent._running:
                 await _browser_agent.async_start()
                 _ui_status = "▶️ 自动化任务运行中"
@@ -319,8 +355,8 @@ def create_main_panel():
     """
     gr.Markdown("### 🎯 任务控制")
     gr.Markdown(
-        "**Edge 浏览器：** 请先双击项目根目录 `start_edge.bat` 启动 Edge，"
-        "再在下方点击「启动自动求职」。（启动本应用不会自动打开 Edge）"
+        "**Edge 浏览器：** browser 模式需先运行 `start_edge.bat`；"
+        "**vision 模式** 只需将 BOSS 直聘窗口置于前台（无需 CDP）。"
     )
 
     with gr.Row():
@@ -389,6 +425,13 @@ def create_main_panel():
     gr.Markdown("### ⚙️ 快速设置")
 
     with gr.Accordion("高级选项", open=False):
+        settings = load_settings()
+        default_mode = str(settings.get("automation_mode") or "browser")
+        automation_mode = gr.Radio(
+            choices=["browser", "vision"],
+            value=default_mode if default_mode in ("browser", "vision") else "browser",
+            label="自动化模式（browser=DOM+Edge | vision=截图+Vision+MCP）",
+        )
         daily_limit = gr.Slider(
             minimum=1,
             maximum=100,
@@ -424,7 +467,7 @@ def create_main_panel():
     # 启动按钮绑定
     start_btn.click(
         fn=on_start_click,
-        inputs=[daily_limit, match_threshold, delay_min, delay_max],
+        inputs=[daily_limit, match_threshold, delay_min, delay_max, automation_mode],
         outputs=[status_text, start_btn, pause_btn, stop_btn]
     )
 

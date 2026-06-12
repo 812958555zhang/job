@@ -1,0 +1,5 @@
+# 视觉驱动模式额外依赖（在 requirements.txt 基础上安装）
+mss>=9.0.0
+pyautogui>=0.9.54
+pyperclip>=1.8.2
+Pillow>=10.0.0

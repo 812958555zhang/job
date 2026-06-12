@@ -33,3 +33,6 @@ industry_preference: []
 
 # 黑名单公司（排除不投递的公司）
 blacklist_companies: []
+
+# 自动化模式: browser（DOM+CDP）| vision（截图+Vision+MCP）
+automation_mode: browser

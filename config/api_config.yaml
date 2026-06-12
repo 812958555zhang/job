@@ -18,8 +18,8 @@ volcengine:
     text: GLM-5.1
     # 聊天模型（用于对话、话术生成等）
     chat: GLM-5.1
-    # 视觉模型（用于简历图片解析）
-    vision: Doubao-Seed3D-2.0
+    # 视觉模型（用于截图识别、简历图片解析）
+    vision: GLM-5.1
   # 请求配置
   timeout: 60
   max_retries: 3
