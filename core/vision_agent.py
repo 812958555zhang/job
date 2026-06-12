@@ -129,6 +129,7 @@ class VisionAgent:
         self._profile = user_profile
         self._logger = get_logger(__name__)
         self.state = TaskState()
+        self._seen_job_keys: set[str] = set()
 
     async def run_job_search_loop(
         self,
@@ -216,6 +217,17 @@ class VisionAgent:
                 job = _job_dict_to_job_info(job_data)
                 if not job:
                     continue
+
+                job_key = "|".join(
+                    filter(
+                        None,
+                        [job.job_name, job.company_name or "", job.location or ""],
+                    )
+                )
+                if job_key in self._seen_job_keys:
+                    _logger.debug("本屏已扫描过，跳过重复岗位: %s", job.job_name)
+                    continue
+                self._seen_job_keys.add(job_key)
 
                 stats["total_count"] += 1
                 result = self._screener.score(job)
@@ -306,16 +318,76 @@ class VisionAgent:
             return content
         return []
 
-    async def _scroll_job_list(self, elements: List[ScreenElement]) -> None:
-        list_elem = ScreenVision.find_element_by_name(elements, "岗位", fuzzy=True)
-        params: Dict[str, Any] = {"clicks": -4}
-        if list_elem:
-            cx, cy = list_elem.center
-            params.update({"x": cx, "y": cy})
-        await asyncio.to_thread(
-            self._tools.execute_action, {"tool": "scroll", "params": params}
+    def _resolve_list_scroll_position(
+        self, elements: List[ScreenElement]
+    ) -> tuple[int, int]:
+        """定位 BOSS 左侧岗位列表的滚轮落点（优先用「立即沟通」等列表内元素）"""
+        chat_buttons = [
+            e
+            for e in elements
+            if "沟通" in (e.name or "") or "沟通" in (e.text or "")
+        ]
+        if chat_buttons:
+            xs = [e.center[0] for e in chat_buttons]
+            ys = [e.center[1] for e in chat_buttons]
+            return int(sum(xs) / len(xs)), int(sum(ys) / len(ys))
+
+        for keyword in ("职位列表", "岗位列表", "职位", "搜索"):
+            elem = ScreenVision.find_element_by_name(elements, keyword, fuzzy=True)
+            if elem and elem.width > 80 and elem.height > 80:
+                return elem.center
+
+        list_candidates = [
+            e
+            for e in elements
+            if e.element_type in ("list", "container", "card", "job_card")
+            and e.width > 180
+            and e.height > 240
+        ]
+        if list_candidates:
+            target = min(list_candidates, key=lambda e: e.x)
+            return (
+                target.x + target.width // 2,
+                target.y + min(target.height // 2, 420),
+            )
+
+        try:
+            import pyautogui
+
+            width, height = pyautogui.size()
+            return int(width * 0.22), int(height * 0.55)
+        except Exception:
+            return 400, 500
+
+    async def _scroll_job_list(
+        self,
+        elements: List[ScreenElement],
+        steps: int = 6,
+        clicks_per_step: int = -10,
+        pause: float = 0.65,
+    ) -> None:
+        """在左侧岗位列表上分步滚轮，触发 BOSS 懒加载"""
+        x, y = self._resolve_list_scroll_position(elements)
+        _logger.info(
+            "岗位列表滚轮加载 | 位置=(%s,%s) | %s步 × %s格",
+            x,
+            y,
+            steps,
+            abs(clicks_per_step),
         )
-        await asyncio.sleep(1.0)
+
+        for _ in range(max(1, steps)):
+            await asyncio.to_thread(
+                self._tools.execute_action,
+                {
+                    "tool": "scroll",
+                    "params": {"x": x, "y": y, "clicks": clicks_per_step},
+                },
+            )
+            await asyncio.sleep(pause)
+
+        # 等待懒加载渲染新岗位
+        await asyncio.sleep(1.5)
 
     async def _perform_chat_action(
         self,
